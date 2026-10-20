@@ -1,0 +1,713 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 110;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		473C4C7A3084AD6700C1B90E /* MLXGuidedGeneration in Frameworks */ = {isa = PBXBuildFile; productRef = 473C4C793084AD6700C1B90E /* MLXGuidedGeneration */; };
+		473C4C7C3084AD6700C1B90E /* MLXLLM in Frameworks */ = {isa = PBXBuildFile; productRef = 473C4C7B3084AD6700C1B90E /* MLXLLM */; };
+		473C4C853084AE9200C1B90E /* Tokenizers in Frameworks */ = {isa = PBXBuildFile; productRef = 473C4C843084AE9200C1B90E /* Tokenizers */; };
+		473C4C8A3084AF9A00C1B90E /* FluidAudio in Frameworks */ = {isa = PBXBuildFile; productRef = 473C4C893084AF9A00C1B90E /* FluidAudio */; };
+		473C4C8C3084AFAA00C1B90E /* MLXLMCommon in Frameworks */ = {isa = PBXBuildFile; productRef = 473C4C8B3084AFAA00C1B90E /* MLXLMCommon */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		47223C623084401100C520EE /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 47223C4C3084400F00C520EE /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 47223C533084400F00C520EE;
+			remoteInfo = Keystorm;
+		};
+		47223C6C3084401100C520EE /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 47223C4C3084400F00C520EE /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 47223C533084400F00C520EE;
+			remoteInfo = Keystorm;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		47223C543084400F00C520EE /* Keystorm.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Keystorm.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		47223C613084401100C520EE /* KeystormTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = KeystormTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		47223C6B3084401100C520EE /* KeystormUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = KeystormUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		473C4D7E3085161600C1B90E /* preflight.py */ = {isa = PBXFileReference; lastKnownFileType = text.script.python; path = preflight.py; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFileSystemSynchronizedRootGroup section */
+		47223C563084400F00C520EE /* Keystorm */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = Keystorm;
+			sourceTree = "<group>";
+		};
+		47223C643084401100C520EE /* KeystormTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = KeystormTests;
+			sourceTree = "<group>";
+		};
+		47223C6E3084401100C520EE /* KeystormUITests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = KeystormUITests;
+			sourceTree = "<group>";
+		};
+/* End PBXFileSystemSynchronizedRootGroup section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		47223C513084400F00C520EE /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			files = (
+				473C4C8C3084AFAA00C1B90E /* MLXLMCommon in Frameworks */,
+				473C4C8A3084AF9A00C1B90E /* FluidAudio in Frameworks */,
+				473C4C7C3084AD6700C1B90E /* MLXLLM in Frameworks */,
+				473C4C7A3084AD6700C1B90E /* MLXGuidedGeneration in Frameworks */,
+				473C4C853084AE9200C1B90E /* Tokenizers in Frameworks */,
+			);
+		};
+		47223C5E3084401100C520EE /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			files = (
+			);
+		};
+		47223C683084401100C520EE /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			files = (
+			);
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		47223C4B3084400F00C520EE = {
+			isa = PBXGroup;
+			children = (
+				47223C563084400F00C520EE /* Keystorm */,
+				47223C643084401100C520EE /* KeystormTests */,
+				47223C6E3084401100C520EE /* KeystormUITests */,
+				473C4C883084AF9A00C1B90E /* Frameworks */,
+				47223C553084400F00C520EE /* Products */,
+				473C4D7D3085161600C1B90E /* Release */,
+			);
+			sourceTree = "<group>";
+		};
+		47223C553084400F00C520EE /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				47223C543084400F00C520EE /* Keystorm.app */,
+				47223C613084401100C520EE /* KeystormTests.xctest */,
+				47223C6B3084401100C520EE /* KeystormUITests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		473C4C883084AF9A00C1B90E /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		473C4D7D3085161600C1B90E /* Release */ = {
+			isa = PBXGroup;
+			children = (
+				473C4D7E3085161600C1B90E /* preflight.py */,
+			);
+			path = Release;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		47223C533084400F00C520EE /* Keystorm */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 47223C733084401100C520EE /* Build configuration list for PBXNativeTarget "Keystorm" */;
+			buildPhases = (
+				47223C503084400F00C520EE /* Sources */,
+				47223C513084400F00C520EE /* Frameworks */,
+				47223C523084400F00C520EE /* Resources */,
+			);
+			buildRules = (
+			);
+			fileSystemSynchronizedGroups = (
+				47223C563084400F00C520EE /* Keystorm */,
+			);
+			name = Keystorm;
+			packageProductDependencies = (
+				473C4C793084AD6700C1B90E /* MLXGuidedGeneration */,
+				473C4C7B3084AD6700C1B90E /* MLXLLM */,
+				473C4C843084AE9200C1B90E /* Tokenizers */,
+				473C4C893084AF9A00C1B90E /* FluidAudio */,
+				473C4C8B3084AFAA00C1B90E /* MLXLMCommon */,
+			);
+			productName = Keystorm;
+			productReference = 47223C543084400F00C520EE /* Keystorm.app */;
+			productType = "com.apple.product-type.application";
+		};
+		47223C603084401100C520EE /* KeystormTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 47223C763084401100C520EE /* Build configuration list for PBXNativeTarget "KeystormTests" */;
+			buildPhases = (
+				47223C5D3084401100C520EE /* Sources */,
+				47223C5E3084401100C520EE /* Frameworks */,
+				47223C5F3084401100C520EE /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				47223C633084401100C520EE /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				47223C643084401100C520EE /* KeystormTests */,
+			);
+			name = KeystormTests;
+			productName = KeystormTests;
+			productReference = 47223C613084401100C520EE /* KeystormTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+		47223C6A3084401100C520EE /* KeystormUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 47223C793084401100C520EE /* Build configuration list for PBXNativeTarget "KeystormUITests" */;
+			buildPhases = (
+				47223C673084401100C520EE /* Sources */,
+				47223C683084401100C520EE /* Frameworks */,
+				47223C693084401100C520EE /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				47223C6D3084401100C520EE /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				47223C6E3084401100C520EE /* KeystormUITests */,
+			);
+			name = KeystormUITests;
+			productName = KeystormUITests;
+			productReference = 47223C6B3084401100C520EE /* KeystormUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		47223C4C3084400F00C520EE /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 2700;
+				LastUpgradeCheck = 2700;
+				TargetAttributes = {
+					47223C533084400F00C520EE = {
+						CreatedOnToolsVersion = 27.0;
+					};
+					47223C603084401100C520EE = {
+						CreatedOnToolsVersion = 27.0;
+						TestTargetID = 47223C533084400F00C520EE;
+					};
+					47223C6A3084401100C520EE = {
+						CreatedOnToolsVersion = 27.0;
+						TestTargetID = 47223C533084400F00C520EE;
+					};
+				};
+			};
+			buildConfigurationList = 47223C4F3084400F00C520EE /* Build configuration list for PBXProject "Keystorm" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 47223C4B3084400F00C520EE;
+			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				473C4C6F3084AC7B00C1B90E /* XCRemoteSwiftPackageReference "FluidAudio" */,
+				473C4C783084AD6700C1B90E /* XCRemoteSwiftPackageReference "mlx-swift-lm" */,
+				473C4C833084AE9200C1B90E /* XCRemoteSwiftPackageReference "swift-transformers" */,
+			);
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 47223C553084400F00C520EE /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				47223C533084400F00C520EE /* Keystorm */,
+				47223C603084401100C520EE /* KeystormTests */,
+				47223C6A3084401100C520EE /* KeystormUITests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		47223C523084400F00C520EE /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			files = (
+			);
+		};
+		47223C5F3084401100C520EE /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			files = (
+			);
+		};
+		47223C693084401100C520EE /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			files = (
+			);
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		47223C503084400F00C520EE /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			files = (
+			);
+		};
+		47223C5D3084401100C520EE /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			files = (
+			);
+		};
+		47223C673084401100C520EE /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			files = (
+			);
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		47223C633084401100C520EE /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 47223C533084400F00C520EE /* Keystorm */;
+			targetProxy = 47223C623084401100C520EE /* PBXContainerItemProxy */;
+		};
+		47223C6D3084401100C520EE /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 47223C533084400F00C520EE /* Keystorm */;
+			targetProxy = 47223C6C3084401100C520EE /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		47223C713084401100C520EE /* Debug configuration for PBXProject "Keystorm" */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		47223C723084401100C520EE /* Release configuration for PBXProject "Keystorm" */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				SWIFT_COMPILATION_MODE = wholemodule;
+			};
+			name = Release;
+		};
+		47223C743084401100C520EE /* Debug configuration for PBXNativeTarget "Keystorm" */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 84PD63F63N;
+				ENABLE_APP_SANDBOX = NO;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_INCOMING_NETWORK_CONNECTIONS = NO;
+				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
+				ENABLE_PREVIEWS = YES;
+				ENABLE_RESOURCE_ACCESS_AUDIO_INPUT = YES;
+				ENABLE_RESOURCE_ACCESS_BLUETOOTH = NO;
+				ENABLE_RESOURCE_ACCESS_CALENDARS = NO;
+				ENABLE_RESOURCE_ACCESS_CAMERA = NO;
+				ENABLE_RESOURCE_ACCESS_CONTACTS = NO;
+				ENABLE_RESOURCE_ACCESS_LOCATION = NO;
+				ENABLE_RESOURCE_ACCESS_PRINTING = NO;
+				ENABLE_RESOURCE_ACCESS_USB = NO;
+				ENABLE_USER_SELECTED_FILES = readonly;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Record your spoken thoughts into durable local sessions. Audio stays on this Mac.";
+				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
+				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
+				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
+				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphonesimulator*]" = YES;
+				"INFOPLIST_KEY_UILaunchScreen_Generation[sdk=iphoneos*]" = YES;
+				"INFOPLIST_KEY_UILaunchScreen_Generation[sdk=iphonesimulator*]" = YES;
+				"INFOPLIST_KEY_UIStatusBarStyle[sdk=iphoneos*]" = UIStatusBarStyleDefault;
+				"INFOPLIST_KEY_UIStatusBarStyle[sdk=iphonesimulator*]" = UIStatusBarStyleDefault;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				IPHONEOS_DEPLOYMENT_TARGET = 27.0;
+				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
+				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
+				MACOSX_DEPLOYMENT_TARGET = 27.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.mitternacht.Keystorm;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				REGISTER_APP_GROUPS = YES;
+				SDKROOT = auto;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SUPPORTED_PLATFORMS = macosx;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = nonisolated;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2,7";
+				XROS_DEPLOYMENT_TARGET = 27.0;
+			};
+			name = Debug;
+		};
+		47223C753084401100C520EE /* Release configuration for PBXNativeTarget "Keystorm" */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 84PD63F63N;
+				ENABLE_APP_SANDBOX = NO;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_INCOMING_NETWORK_CONNECTIONS = NO;
+				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
+				ENABLE_PREVIEWS = YES;
+				ENABLE_RESOURCE_ACCESS_AUDIO_INPUT = YES;
+				ENABLE_RESOURCE_ACCESS_BLUETOOTH = NO;
+				ENABLE_RESOURCE_ACCESS_CALENDARS = NO;
+				ENABLE_RESOURCE_ACCESS_CAMERA = NO;
+				ENABLE_RESOURCE_ACCESS_CONTACTS = NO;
+				ENABLE_RESOURCE_ACCESS_LOCATION = NO;
+				ENABLE_RESOURCE_ACCESS_PRINTING = NO;
+				ENABLE_RESOURCE_ACCESS_USB = NO;
+				ENABLE_USER_SELECTED_FILES = readonly;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Record your spoken thoughts into durable local sessions. Audio stays on this Mac.";
+				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
+				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
+				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
+				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphonesimulator*]" = YES;
+				"INFOPLIST_KEY_UILaunchScreen_Generation[sdk=iphoneos*]" = YES;
+				"INFOPLIST_KEY_UILaunchScreen_Generation[sdk=iphonesimulator*]" = YES;
+				"INFOPLIST_KEY_UIStatusBarStyle[sdk=iphoneos*]" = UIStatusBarStyleDefault;
+				"INFOPLIST_KEY_UIStatusBarStyle[sdk=iphonesimulator*]" = UIStatusBarStyleDefault;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				IPHONEOS_DEPLOYMENT_TARGET = 27.0;
+				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
+				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
+				MACOSX_DEPLOYMENT_TARGET = 27.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.mitternacht.Keystorm;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				REGISTER_APP_GROUPS = YES;
+				SDKROOT = auto;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SUPPORTED_PLATFORMS = macosx;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = nonisolated;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2,7";
+				XROS_DEPLOYMENT_TARGET = 27.0;
+			};
+			name = Release;
+		};
+		47223C773084401100C520EE /* Debug configuration for PBXNativeTarget "KeystormTests" */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 84PD63F63N;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 27.0;
+				MACOSX_DEPLOYMENT_TARGET = 27.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.mitternacht.KeystormTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = auto;
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SUPPORTED_PLATFORMS = macosx;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = nonisolated;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2,7";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Keystorm.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Keystorm";
+				XROS_DEPLOYMENT_TARGET = 27.0;
+			};
+			name = Debug;
+		};
+		47223C783084401100C520EE /* Release configuration for PBXNativeTarget "KeystormTests" */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 84PD63F63N;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 27.0;
+				MACOSX_DEPLOYMENT_TARGET = 27.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.mitternacht.KeystormTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = auto;
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SUPPORTED_PLATFORMS = macosx;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = nonisolated;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2,7";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Keystorm.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Keystorm";
+				XROS_DEPLOYMENT_TARGET = 27.0;
+			};
+			name = Release;
+		};
+		47223C7A3084401100C520EE /* Debug configuration for PBXNativeTarget "KeystormUITests" */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 84PD63F63N;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 27.0;
+				MACOSX_DEPLOYMENT_TARGET = 27.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.mitternacht.KeystormUITests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = auto;
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SUPPORTED_PLATFORMS = macosx;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = nonisolated;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2,7";
+				TEST_TARGET_NAME = Keystorm;
+				XROS_DEPLOYMENT_TARGET = 27.0;
+			};
+			name = Debug;
+		};
+		47223C7B3084401100C520EE /* Release configuration for PBXNativeTarget "KeystormUITests" */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 84PD63F63N;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 27.0;
+				MACOSX_DEPLOYMENT_TARGET = 27.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.mitternacht.KeystormUITests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = auto;
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SUPPORTED_PLATFORMS = macosx;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = nonisolated;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2,7";
+				TEST_TARGET_NAME = Keystorm;
+				XROS_DEPLOYMENT_TARGET = 27.0;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		47223C4F3084400F00C520EE /* Build configuration list for PBXProject "Keystorm" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				47223C713084401100C520EE /* Debug configuration for PBXProject "Keystorm" */,
+				47223C723084401100C520EE /* Release configuration for PBXProject "Keystorm" */,
+			);
+			defaultConfigurationName = Release;
+		};
+		47223C733084401100C520EE /* Build configuration list for PBXNativeTarget "Keystorm" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				47223C743084401100C520EE /* Debug configuration for PBXNativeTarget "Keystorm" */,
+				47223C753084401100C520EE /* Release configuration for PBXNativeTarget "Keystorm" */,
+			);
+			defaultConfigurationName = Release;
+		};
+		47223C763084401100C520EE /* Build configuration list for PBXNativeTarget "KeystormTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				47223C773084401100C520EE /* Debug configuration for PBXNativeTarget "KeystormTests" */,
+				47223C783084401100C520EE /* Release configuration for PBXNativeTarget "KeystormTests" */,
+			);
+			defaultConfigurationName = Release;
+		};
+		47223C793084401100C520EE /* Build configuration list for PBXNativeTarget "KeystormUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				47223C7A3084401100C520EE /* Debug configuration for PBXNativeTarget "KeystormUITests" */,
+				47223C7B3084401100C520EE /* Release configuration for PBXNativeTarget "KeystormUITests" */,
+			);
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		473C4C6F3084AC7B00C1B90E /* XCRemoteSwiftPackageReference "FluidAudio" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/FluidInference/FluidAudio";
+			requirement = {
+				kind = revision;
+				revision = 2d6c42ca5f3accc0faf9fee9e0fff5b9b2cf6042;
+			};
+		};
+		473C4C783084AD6700C1B90E /* XCRemoteSwiftPackageReference "mlx-swift-lm" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/ml-explore/mlx-swift-lm";
+			requirement = {
+				kind = revision;
+				revision = 48114eedf3c3d4a682a6b1d644cc5af5c2945d10;
+			};
+		};
+		473C4C833084AE9200C1B90E /* XCRemoteSwiftPackageReference "swift-transformers" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/huggingface/swift-transformers";
+			requirement = {
+				kind = exactVersion;
+				version = 1.3.5;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		473C4C793084AD6700C1B90E /* MLXGuidedGeneration */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 473C4C783084AD6700C1B90E /* XCRemoteSwiftPackageReference "mlx-swift-lm" */;
+			productName = MLXGuidedGeneration;
+		};
+		473C4C7B3084AD6700C1B90E /* MLXLLM */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 473C4C783084AD6700C1B90E /* XCRemoteSwiftPackageReference "mlx-swift-lm" */;
+			productName = MLXLLM;
+		};
+		473C4C843084AE9200C1B90E /* Tokenizers */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 473C4C833084AE9200C1B90E /* XCRemoteSwiftPackageReference "swift-transformers" */;
+			productName = Tokenizers;
+		};
+		473C4C893084AF9A00C1B90E /* FluidAudio */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 473C4C6F3084AC7B00C1B90E /* XCRemoteSwiftPackageReference "FluidAudio" */;
+			productName = FluidAudio;
+		};
+		473C4C8B3084AFAA00C1B90E /* MLXLMCommon */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 473C4C783084AD6700C1B90E /* XCRemoteSwiftPackageReference "mlx-swift-lm" */;
+			productName = MLXLMCommon;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = 47223C4C3084400F00C520EE /* Project object */;
+	validationLevel = 1;
+}

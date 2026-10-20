@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Privacy · Keystorm</title>
+  <meta name="description" content="What Keystorm stores, what it sends, and which macOS permissions it uses.">
+  <meta name="theme-color" content="#161618">
+  <meta name="color-scheme" content="dark">
+  <link rel="canonical" href="https://mitternacht.github.io/keystorm/privacy.html">
+  <link rel="icon" type="image/png" sizes="32x32" href="assets/img/favicon-32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="assets/img/favicon-16.png">
+  <link rel="apple-touch-icon" href="assets/img/apple-touch-icon.png">
+  <link rel="stylesheet" href="assets/css/site.css">
+  <script src="assets/js/site.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <div class="ambient" aria-hidden="true"><span class="light light-a"></span><span class="light light-b"></span></div>
+
+  <header class="nav-wrap">
+    <nav class="nav glass" aria-label="Main">
+      <a class="brand" href="./" aria-label="Keystorm home">
+        <img src="assets/img/icon-64.png" width="28" height="28" alt="">
+        <span>Keystorm</span>
+      </a>
+      <ul class="nav-links">
+        <li><a href="./#how">How it works</a></li>
+        <li><a href="./#modes">Modes</a></li>
+        <li><a href="./#privacy">Privacy</a></li>
+        <li><a href="./#details">Details</a></li>
+      </ul>
+      <a class="btn btn-glass btn-small" href="https://github.com/Mitternacht/keystorm">GitHub</a>
+    </nav>
+  </header>
+
+  <main id="main" class="article">
+    <p class="eyebrow">Privacy</p>
+    <h1>Your voice stays on your Mac.</h1>
+    <p>Keystorm is built so that dictation works without sending your audio or text anywhere. This page describes the app as it is today, while it is still in development.</p>
+
+    <h2>What Keystorm sends</h2>
+    <p><strong>Nothing while you dictate.</strong> Speech recognition and text cleanup run on your Mac. There is no account, no cloud service, no analytics and no crash-reporting service.</p>
+    <p>The only network use is downloading the speech and text models, and only when you choose to install them. They come from Hugging Face, and every file is checked against a checksum pinned in the app. Like any download, Hugging Face can see the request.</p>
+
+    <h2>What Keystorm stores</h2>
+    <ul>
+      <li><strong>Recordings, transcripts and versions</strong> are saved in <code>~/Library/Application Support/Keystorm</code> on this Mac, so a crash or restart doesn’t lose them. The downloaded models live there too.</li>
+      <li><strong>Learned words</strong> are stored on this Mac only if you turn learning on, and each one needs your approval before it is used.</li>
+      <li><strong>Settings</strong> such as shortcuts and blocked apps are stored in the app’s preferences.</li>
+    </ul>
+    <p>You can export recordings as files. Moving a recording to Keystorm’s Trash can be undone; to delete everything for good, quit Keystorm and delete the folder above.</p>
+
+    <h2>Permissions</h2>
+    <ul>
+      <li><strong>Microphone</strong> is used only while you record.</li>
+      <li><strong>Accessibility</strong> lets Keystorm find the text field you started in and put the result there. In TextEdit it also confirms that the text arrived. Without this permission, dictation still works and the text stays in Keystorm for you to copy.</li>
+    </ul>
+
+    <h2>What Keystorm reads</h2>
+    <ul>
+      <li><strong>Blocked websites.</strong> If you block a website, Keystorm reads the address of the page you are typing in when you start and again before pasting. It compares the address on your Mac and never saves it.</li>
+      <li><strong>Context.</strong> An optional setting, off by default, can give the local model nearby text to improve cleanup. That text is not saved.</li>
+      <li><strong>Clipboard.</strong> When Keystorm pastes into an app, it places the text on the clipboard for a moment and restores what you had there whenever it can.</li>
+    </ul>
+    <p>Password fields are always excluded, and so are these password managers: 1Password, Apple Passwords, Keychain Access, Bitwarden, KeePassXC, LastPass, Dashlane, Enpass and Proton Pass. Keystorm reads nothing from them and pastes nothing into them. You can block any other app in Settings.</p>
+
+    <h2>This website</h2>
+    <p>This site is hosted on GitHub Pages. It sets no cookies and runs no analytics. GitHub may keep its own server logs, as described in GitHub’s privacy statement.</p>
+
+    <p class="updated">Last updated October 2026.</p>
+  </main>
+
+  <footer class="footer">
+    <div class="footer-inner">
+      <span class="footer-brand"><img src="assets/img/icon-64.png" width="20" height="20" alt="">Keystorm</span>
+      <nav aria-label="Footer"><a href="./">Home</a><a href="https://github.com/Mitternacht/keystorm">GitHub</a></nav>
+    </div>
+  </footer>
+</body>
+</html>
