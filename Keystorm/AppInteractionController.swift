@@ -150,9 +150,9 @@ final class AppInteractionController {
         withObservationTracking {
             if let dictation {
                 _ = dictation.state; _ = dictation.message; _ = dictation.isTransitioning
-                _ = dictation.wantsRecordingHUD
+                _ = dictation.wantsRecordingHUD; _ = dictation.recordingHUDDismissed
                 if let handle = dictation.handle { nextCaptureStatus = workspace.dictationCaptureStatus(handle) }
-                showDictation = dictation.wantsRecordingHUD && (dictation.hasActiveRecording ||
+                showDictation = dictation.wantsRecordingHUD && !dictation.recordingHUDDismissed && (dictation.hasActiveRecording ||
                     (dictation.state == .ready && dictation.handle != nil) || dictation.state == .failed)
                 dictationElapsed = workspace.recordingHUDElapsed
             }
@@ -170,7 +170,8 @@ final class AppInteractionController {
         // Reconcile and presentation writes stay outside observation tracking.
         dictation?.reconcileCaptureStatus(nextCaptureStatus)
         if let dictation {
-            showDictation = dictation.wantsRecordingHUD && (dictation.hasActiveRecording ||
+            // A dismissed HUD stays hidden until the next Start, whatever changes after it.
+            showDictation = dictation.wantsRecordingHUD && !dictation.recordingHUDDismissed && (dictation.hasActiveRecording ||
                 (dictation.state == .ready && dictation.handle != nil) || dictation.state == .failed)
         }
         if showDictation {

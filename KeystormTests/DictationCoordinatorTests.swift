@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Testing
 @testable import Keystorm
@@ -86,7 +87,7 @@ struct DictationCoordinatorTests {
         rig.coordinator.toggle()
         await rig.backend.waitFor(.begin)
         #expect(rig.coordinator.state == .starting)
-        rig.coordinator.toggle()
+        // A toggle here is remembered as Finish; see pressDuringStartFinishesOnceRecording.
         rig.coordinator.finish()
         rig.coordinator.pauseResume()
         #expect(rig.backend.count(.begin) == 1)
@@ -177,7 +178,9 @@ struct DictationCoordinatorTests {
         await rig.coordinator.waitUntilSettled()
         #expect(rig.coordinator.state == .ready)
         #expect(rig.coordinator.resultText == rig.backend.completedRevision.text)
-        #expect(rig.coordinator.message == CoordinatorFailure.persistence.localizedDescription)
+        #expect(rig.coordinator.message == CoordinatorFailure.persistence.localizedDescription +
+            " Copied to the clipboard. Paste it where you want it.")
+        #expect(rig.pasteboard.string(forType: .string) == rig.backend.completedRevision.text)
         #expect(rig.adapter.writeCount == 0)
         rig.coordinator.finish()
         await rig.coordinator.waitUntilSettled()
@@ -393,6 +396,175 @@ struct DictationCoordinatorTests {
         #expect(rig.coordinator.resultText == rig.backend.completedRevision.text)
         #expect(rig.backend.count(.begin) == 1)
         #expect(rig.adapter.writeCount == 1)
+    }
+
+    @Test("A second press while Start is still opening the microphone finishes the recording without a third press")
+    func pressDuringStartFinishesOnceRecording() async {
+        let rig = CoordinatorRig()
+        rig.backend.suspended = [.begin]
+        rig.coordinator.toggle()
+        await rig.backend.waitFor(.begin)
+        #expect(rig.coordinator.state == .starting)
+        rig.coordinator.toggle()
+        #expect(rig.coordinator.state == .starting)
+        #expect(rig.backend.count(.complete) == 0)
+        rig.backend.release(.begin)
+        await rig.coordinator.waitUntilSettled()
+        #expect(rig.coordinator.state == .ready)
+        #expect(rig.backend.count(.begin) == 1)
+        #expect(rig.backend.count(.complete) == 1)
+        #expect(rig.coordinator.resultText == rig.backend.completedRevision.text)
+        #expect(rig.adapter.writeCount == 1)
+    }
+
+    @Test("A press remembered during Start is dropped when that Start is cancelled")
+    func cancelledStartDropsRememberedPress() async {
+        let rig = CoordinatorRig()
+        rig.backend.suspended = [.begin]
+        rig.coordinator.toggle()
+        await rig.backend.waitFor(.begin)
+        rig.coordinator.toggle()
+        rig.coordinator.cancel()
+        rig.backend.release(.begin)
+        await rig.coordinator.waitUntilSettled()
+        #expect(rig.backend.count(.complete) == 0)
+        #expect(!rig.coordinator.hasActiveRecording)
+        rig.coordinator.toggle()
+        await rig.coordinator.waitUntilSettled()
+        #expect(rig.coordinator.state == .recording)
+        #expect(rig.backend.count(.complete) == 0)
+        #expect(rig.adapter.writeCount == 0)
+    }
+
+    @Test("A destination refused at Start gets the finished text on the clipboard with a Copied receipt")
+    func refusedDestinationCopiesResultOnFinish() async throws {
+        let rig = CoordinatorRig()
+        rig.adapter.isTrusted = false
+        rig.coordinator.toggle()
+        await rig.coordinator.waitUntilSettled()
+        #expect(rig.coordinator.destinationLabel == "Copy after recording")
+        rig.coordinator.finish()
+        await rig.coordinator.waitUntilSettled()
+        #expect(rig.coordinator.state == .ready)
+        #expect(rig.adapter.writeCount == 0)
+        #expect(rig.pasteboard.string(forType: .string) == rig.backend.completedRevision.text)
+        let receipt = try #require(rig.backend.metadata?.delivery)
+        #expect(receipt.state == .copied)
+        #expect(receipt.textRevisionID == rig.backend.completedRevision.id)
+        #expect(rig.coordinator.message == "Copied to the clipboard. Paste it where you want it.")
+        #expect(!rig.coordinator.deliveredOnFinish)
+    }
+
+    @Test("With Copy when not inserted off, the finished text stays in Keystorm and the clipboard is untouched")
+    func copyWhenNotInsertedOffKeepsClipboard() async {
+        let rig = CoordinatorRig()
+        rig.coordinator.preferences.copyWhenNotInserted = false
+        rig.adapter.isTrusted = false
+        rig.coordinator.toggle()
+        await rig.coordinator.waitUntilSettled()
+        rig.coordinator.finish()
+        await rig.coordinator.waitUntilSettled()
+        #expect(rig.coordinator.state == .ready)
+        #expect(rig.coordinator.resultText == rig.backend.completedRevision.text)
+        #expect(rig.pasteboard.string(forType: .string) == CoordinatorRig.clipboardSentinel)
+        #expect(rig.backend.saved.allSatisfy { $0.delivery == nil })
+        #expect(rig.coordinator.message == "Saved locally. Review or edit the text, then copy it.")
+    }
+
+    @Test("Cancelling Finish never copies, even when transcription completes")
+    func cancelledFinishNeverCopies() async {
+        let rig = CoordinatorRig()
+        rig.adapter.isTrusted = false
+        rig.backend.suspended = [.complete]
+        rig.coordinator.toggle()
+        await rig.coordinator.waitUntilSettled()
+        rig.coordinator.finish()
+        await rig.backend.waitFor(.complete)
+        rig.coordinator.cancel()
+        rig.backend.release(.complete)
+        await rig.coordinator.waitUntilSettled()
+        #expect(!rig.coordinator.hasActiveRecording)
+        #expect(rig.pasteboard.string(forType: .string) == CoordinatorRig.clipboardSentinel)
+        #expect(rig.backend.saved.allSatisfy { $0.delivery?.state != .copied })
+        #expect(rig.coordinator.message.hasPrefix("Cancelled."))
+    }
+
+    @Test("A confirmed insertion never copies the result")
+    func confirmedDeliveryNeverCopies() async {
+        let rig = CoordinatorRig()
+        rig.coordinator.toggle()
+        await rig.coordinator.waitUntilSettled()
+        rig.coordinator.finish()
+        await rig.coordinator.waitUntilSettled()
+        #expect(rig.coordinator.state == .ready)
+        #expect(rig.adapter.writeCount == 1)
+        #expect(rig.coordinator.deliveredOnFinish)
+        #expect(rig.pasteboard.string(forType: .string) == CoordinatorRig.clipboardSentinel)
+        #expect(rig.backend.saved.compactMap(\.delivery?.state) == [.pending, .inserted])
+        #expect(rig.coordinator.message == "Inserted into TextEdit.")
+    }
+
+    @Test("Finish reports transcribing, then inserting, for the HUD title")
+    func processingPhaseFollowsFinish() async {
+        let rig = CoordinatorRig()
+        rig.backend.suspended = [.complete]
+        rig.coordinator.toggle()
+        await rig.coordinator.waitUntilSettled()
+        var phaseAtWrite: DictationProcessingPhase?
+        rig.adapter.onWrite = { [weak coordinator = rig.coordinator] in phaseAtWrite = coordinator?.processingPhase }
+        rig.coordinator.finish()
+        await rig.backend.waitFor(.complete)
+        #expect(rig.coordinator.processingPhase == .transcribing)
+        rig.backend.release(.complete)
+        await rig.coordinator.waitUntilSettled()
+        #expect(phaseAtWrite == .inserting)
+        #expect(rig.coordinator.state == .ready)
+    }
+
+    @Test("Dismiss keeps the HUD hidden for this take until the next Start")
+    func dismissedHUDStaysHiddenUntilNextStart() async {
+        let rig = CoordinatorRig()
+        rig.adapter.isTrusted = false
+        rig.coordinator.toggle()
+        await rig.coordinator.waitUntilSettled()
+        rig.coordinator.finish()
+        await rig.coordinator.waitUntilSettled()
+        #expect(rig.coordinator.wantsRecordingHUD)
+        rig.coordinator.dismissRecordingHUD()
+        #expect(rig.coordinator.recordingHUDDismissed)
+        rig.coordinator.copyResult()
+        await rig.coordinator.waitUntilSettled()
+        #expect(rig.coordinator.recordingHUDDismissed)
+        rig.coordinator.toggle()
+        #expect(!rig.coordinator.recordingHUDDismissed)
+        await rig.coordinator.waitUntilSettled()
+        #expect(rig.coordinator.state == .recording)
+        #expect(rig.coordinator.wantsRecordingHUD)
+    }
+
+    @Test("A confirmed insertion hides the HUD by itself after showing its outcome; a copied result stays")
+    func deliveredResultHidesHUD() async throws {
+        let rig = CoordinatorRig()
+        rig.coordinator.recordingHUDAutoHideDelay = .milliseconds(20)
+        rig.coordinator.toggle()
+        await rig.coordinator.waitUntilSettled()
+        rig.coordinator.finish()
+        await rig.coordinator.waitUntilSettled()
+        #expect(rig.coordinator.state == .ready)
+        for _ in 0..<100 where !rig.coordinator.recordingHUDDismissed {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(rig.coordinator.recordingHUDDismissed)
+
+        let copied = CoordinatorRig()
+        copied.coordinator.recordingHUDAutoHideDelay = .milliseconds(20)
+        copied.adapter.isTrusted = false
+        copied.coordinator.toggle()
+        await copied.coordinator.waitUntilSettled()
+        copied.coordinator.finish()
+        await copied.coordinator.waitUntilSettled()
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(!copied.coordinator.recordingHUDDismissed)
     }
 
     @Test("Every status assignment advances the message revision, even when its text repeats")
@@ -948,9 +1120,13 @@ private final class ManualAccessibilityAdapter: DictationDeliveryAdapter {
 
 @MainActor
 private struct CoordinatorRig {
+    /// What the rig's clipboard holds before anything copies to it.
+    static let clipboardSentinel = "Clipboard before dictation"
     let trace: CoordinatorTrace
     let backend: CoordinatorBackend
     let adapter: CoordinatorAdapter
+    /// One named test clipboard, reset for each rig, so Copy never touches the user's clipboard.
+    let pasteboard = NSPasteboard(name: NSPasteboard.Name("Keystorm-DictationCoordinatorTests"))
     let coordinator: DictationCoordinator
     init() {
         let trace = CoordinatorTrace()
@@ -961,5 +1137,8 @@ private struct CoordinatorRig {
         self.adapter = adapter
         coordinator = DictationCoordinator(backend: backend, delivery: DictationDeliveryService(adapter: adapter,
             ownBundleIdentifier: "test.Keystorm", ownProcessIdentifier: 999))
+        pasteboard.clearContents()
+        pasteboard.setString(Self.clipboardSentinel, forType: .string)
+        coordinator.pasteboard = pasteboard
     }
 }

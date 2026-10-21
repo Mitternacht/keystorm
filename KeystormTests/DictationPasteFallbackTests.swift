@@ -1077,6 +1077,8 @@ struct DictationPasteFallbackTests {
         let adapter = PasteFallbackTestAdapter()
         let preferences = DictationPreferences()
         preferences.pasteIntoOtherApps = false
+        // Only the paste setting is under test; Copy when not inserted is covered in DictationCoordinatorTests.
+        preferences.copyWhenNotInserted = false
         let backend = PasteFallbackRecordingBackend()
         let coordinator = DictationCoordinator(backend: backend, delivery: makeService(adapter), preferences: preferences)
         coordinator.toggle()
@@ -1091,13 +1093,17 @@ struct DictationPasteFallbackTests {
         #expect(backend.deliveries.isEmpty)
     }
 
-    @Test("The coordinator records in an embedded terminal with Copy wording and never pastes")
+    @Test("The coordinator records in an embedded terminal with Copy wording, never pastes, and copies the result")
     func coordinatorKeepsEmbeddedTerminalCopyOnly() async {
         let adapter = PasteFallbackTestAdapter()
         adapter.app = DictationDeliveryApplication(processIdentifier: 77, bundleIdentifier: "com.microsoft.VSCode", name: "Code")
         adapter.fieldMetadata.isTerminalInput = true
         let backend = PasteFallbackRecordingBackend()
         let coordinator = DictationCoordinator(backend: backend, delivery: makeService(adapter))
+        let pasteboard = PrivatePasteboard()
+        defer { pasteboard.release() }
+        pasteboard.writeOriginal()
+        coordinator.pasteboard = pasteboard.board
         coordinator.toggle()
         await coordinator.waitUntilSettled()
         #expect(coordinator.state == .recording)
@@ -1109,7 +1115,10 @@ struct DictationPasteFallbackTests {
         #expect(adapter.fallbackPreparations == 0)
         #expect(adapter.performCount == 0)
         #expect(adapter.snapshotReads == 0)
-        #expect(backend.deliveries.isEmpty)
+        // Nothing was pasted, so the finished text is copied for a manual paste into the terminal.
+        #expect(backend.deliveries.map(\.state) == [.copied])
+        #expect(pasteboard.board.string(forType: .string) == backend.revision.text)
+        #expect(coordinator.message == "Copied to the clipboard. Paste it where you want it.")
     }
 
     @Test("Paste into other apps defaults on, persists explicitly, and restores from the store")

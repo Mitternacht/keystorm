@@ -36,7 +36,12 @@ struct DictationDeliverySettingsView: View {
                     .accessibilityIdentifier("dictation.pasteIntoOtherApps")
                 Text("Paste the finished text into the field you started in. Known terminal apps, recognized terminals inside editors, and password fields are never pasted into. After a confirmed paste your previous clipboard is restored; if a paste can't be confirmed, the result stays on the clipboard instead.")
                     .font(.callout).foregroundStyle(.secondary)
-                Text("TextEdit uses verified insertion instead. Other apps can't report what they inserted, so check the result. When this is off, or a field can't be checked, the result stays in Keystorm to copy. Changes apply to the next recording.")
+                Text("TextEdit uses verified insertion instead. Other apps can't report what they inserted, so check the result. When this is off, or a field can't be checked, the result stays in Keystorm. Changes apply to the next recording.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Toggle("Copy when not inserted", isOn: $preferences.copyWhenNotInserted)
+                    .accessibilityHint("Copies finished dictation to the clipboard when it wasn't inserted or pasted.")
+                    .accessibilityIdentifier("dictation.copyWhenNotInserted")
+                Text("When the finished text can't be inserted or pasted, it goes on the clipboard so you can paste it yourself.")
                     .font(.caption).foregroundStyle(.secondary)
             } header: { Text("Delivery") }
             Section {

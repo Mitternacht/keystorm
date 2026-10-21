@@ -540,6 +540,8 @@ private struct CleanFinishRig {
         let adapter = CleanFinishAdapter(trace: trace)
         let preferences = DictationPreferences()
         preferences.mode = mode
+        // Copy when not inserted is covered in DictationCoordinatorTests; this suite asserts receipts and messages without it.
+        preferences.copyWhenNotInserted = false
         self.trace = trace
         self.backend = backend
         self.adapter = adapter

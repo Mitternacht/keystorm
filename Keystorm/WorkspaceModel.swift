@@ -1041,6 +1041,12 @@ final class WorkspaceModel {
             let next = ordered[index + 1]
             if next.intervalID == core.intervalID, abs(core.endTime - next.startTime) < 0.05 { window.append(next); hasRightContext = true }
         }
+        // Live capture rotates after the buffer that reaches 5 s, so segments can run slightly long.
+        // Shed context (right first) until the window fits the worker's cap; the core always stays.
+        // hasRightContext still reports the neighbour so recording does not wait for a tail it has.
+        while window.count > 1, window.reduce(0, { $0 + $1.duration }) > LocalInference.maximumWindowSeconds {
+            if window.last?.id != core.id { window.removeLast() } else { window.removeFirst() }
+        }
         return (window, hasRightContext)
     }
 

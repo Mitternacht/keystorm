@@ -29,6 +29,23 @@ struct DictationPreferencesTests {
         #expect(DictationPreferences(defaults: defaults).mode == .verbatim)
     }
 
+    @Test("Copy when not inserted defaults on, persists explicitly, and restores from the store")
+    func copyWhenNotInsertedDefaultsOnAndPersists() throws {
+        let suiteName = "Keystorm.DictationPreferencesTests.\(UUID())"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        #expect(DictationPreferences().copyWhenNotInserted)
+        let preferences = DictationPreferences(defaults: defaults)
+        #expect(preferences.copyWhenNotInserted)
+        #expect(defaults.object(forKey: DictationPreferences.copyWhenNotInsertedKey) == nil)
+        #expect(DictationPreferences.copyWhenNotInsertedKey == "dictation.copyWhenNotInserted.v1")
+        preferences.copyWhenNotInserted = false
+        #expect(defaults.object(forKey: DictationPreferences.copyWhenNotInsertedKey) as? Bool == false)
+        #expect(!DictationPreferences(defaults: defaults).copyWhenNotInserted)
+        preferences.copyWhenNotInserted = true
+        #expect(DictationPreferences(defaults: defaults).copyWhenNotInserted)
+    }
+
     @Test("Unknown and preview-only modes cannot enable automatic rewriting",
           arguments: ["summarize", "organize", "translateEnglish", "translateGerman", "CLEAN", "EMAIL", "", "futureMode"])
     func invalidModeFallsBackToVerbatim(_ storedValue: String) throws {
