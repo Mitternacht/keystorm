@@ -24,6 +24,8 @@ nonisolated struct SpeechWindowResult: Codable, Sendable {
 /// Networking is confined to install(). Inference loads only app-managed local files.
 actor LocalInference {
     nonisolated static let speechTokenLimit = 150
+    /// Longest transcription window, in seconds of persisted audio, a single job may decode.
+    nonisolated static let maximumWindowSeconds = 15.0
     /// Below this headroom the inactive model leaves before the requested one loads.
     private nonisolated static let coexistenceReserve = 1536 * 1_024 * 1_024
     private let modelDirectory: URL
@@ -197,7 +199,7 @@ actor LocalInference {
         let configuration = try configuration(for: model)
         let ordered = segments.sorted { $0.startTime < $1.startTime }
         guard let first = ordered.first, let last = ordered.last,
-              ordered.reduce(0, { $0 + $1.duration }) <= 15.001 else {
+              ordered.reduce(0, { $0 + $1.duration }) <= Self.maximumWindowSeconds + 0.001 else {
             throw failure("Transcription jobs must contain at most 15 seconds of persisted audio.")
         }
         for (left, right) in zip(ordered, ordered.dropFirst()) {
@@ -218,7 +220,11 @@ actor LocalInference {
             guard try Self.sha256(url) == segment.sha256 else { throw failure("Audio checksum mismatch. Original audio was not modified.") }
             samples.append(contentsOf: try converter.resampleAudioFile(url))
         }
-        guard samples.count <= 240_000 else { throw failure("The audio window exceeds the bounded 15-second job limit.") }
+        // Resampling can round a capped window a few samples past 15 s. Trim that overshoot from the
+        // tail, which is right context whenever the window is long enough to need it, so the model
+        // input and gap recovery stay within 240_000 samples. Larger excess is not rounding.
+        guard samples.count <= 240_000 + 1_600 else { throw failure("The audio window exceeds the bounded 15-second job limit.") }
+        if samples.count > 240_000 { samples.removeLast(samples.count - 240_000) }
         guard samples.allSatisfy(\.isFinite) else { throw failure("The saved audio contains invalid samples.") }
         var state = try TdtDecoderState()
         let result = try await speech.transcribe(samples, decoderState: &state)

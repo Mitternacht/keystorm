@@ -28,6 +28,12 @@ final class DictationHUDController {
 
     func hide() { panel?.orderOut(nil) }
 
+    /// Dismiss keeps the panel hidden for this take; the next Start shows it again.
+    private func dismiss() {
+        coordinator.dismissRecordingHUD()
+        hide()
+    }
+
     private func makePanel() -> DictationHUDPanel {
         let panel = DictationHUDPanel(
             contentRect: NSRect(x: 0, y: 0, width: 560, height: 205),
@@ -47,7 +53,7 @@ final class DictationHUDController {
         panel.animationBehavior = .none
         panel.contentView = DictationHUDHostingView(rootView: DictationHUDView(
             coordinator: coordinator, presentation: presentation, showWorkspace: showWorkspace,
-            dismiss: { [weak self] in self?.hide() }))
+            dismiss: { [weak self] in self?.dismiss() }))
         self.panel = panel
         return panel
     }
@@ -102,10 +108,13 @@ private struct DictationHUDView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            DictationHUDHeader(state: coordinator.state, destination: coordinator.destinationLabel,
+            DictationHUDHeader(state: coordinator.state, processingPhase: coordinator.processingPhase,
+                destination: coordinator.destinationLabel,
                 elapsed: presentation.elapsed, modeTitle: modeTitle,
                 contextStatus: coordinator.contextProfile == nil ? nil : coordinator.contextStatus)
-            DictationHUDPreview(preview: presentation.preview,
+            // A finished result shows the final text, not the last live preview.
+            DictationHUDPreview(preview: coordinator.state == .ready ?
+                    String(coordinator.resultText.prefix(500)) : presentation.preview,
                 isProvisional: coordinator.state == .recording || coordinator.state == .paused)
             DictationHUDActions(coordinator: coordinator,
                 showWorkspace: { showWorkspace() }, dismiss: { dismiss() })
@@ -120,6 +129,7 @@ private struct DictationHUDView: View {
 
 private struct DictationHUDHeader: View {
     let state: DictationFlowState
+    let processingPhase: DictationProcessingPhase
     let destination: String
     let elapsed: Double
     let modeTitle: LocalizedStringResource
@@ -163,9 +173,17 @@ private struct DictationHUDHeader: View {
         case .starting: "Starting…"
         case .recording: "Recording locally"
         case .paused: "Recording paused"
-        case .processing: "Transcribing locally…"
+        case .processing: processingTitle
         case .ready: "Dictation ready"
         case .failed: "Needs attention"
+        }
+    }
+
+    private var processingTitle: LocalizedStringResource {
+        switch processingPhase {
+        case .transcribing: "Transcribing…"
+        case .cleaning: "Cleaning up…"
+        case .inserting: "Inserting…"
         }
     }
 }
@@ -229,6 +247,24 @@ private struct DictationHUDActions: View {
                 .help("Cancel dictation and keep the saved audio. Once insertion begins, it must finish.")
                 .disabled(!coordinator.canCancel)
             } else {
+                if coordinator.state == .ready, !coordinator.deliveredOnFinish {
+                    Button(action: coordinator.copyResult) {
+                        Label("Copy", systemImage: "doc.on.doc")
+                    }
+                    .buttonStyle(.bordered)
+                    .accessibilityLabel("Copy dictation text")
+                    .accessibilityIdentifier("dictation.hud.copy")
+                    .disabled(coordinator.isTransitioning || coordinator.resultText.allSatisfy(\.isWhitespace))
+                } else if coordinator.state == .failed, coordinator.handle != nil {
+                    // The same retry as the workspace: Finish again on the failed recording.
+                    Button(action: coordinator.finish) {
+                        Label("Retry", systemImage: "arrow.clockwise")
+                    }
+                    .buttonStyle(.bordered)
+                    .accessibilityLabel("Retry transcription")
+                    .accessibilityIdentifier("dictation.hud.retry")
+                    .disabled(coordinator.isTransitioning)
+                }
                 Button(action: dismiss) {
                     Image(systemName: "xmark")
                 }

@@ -69,6 +69,12 @@ final class DictationPreferences {
         didSet { defaults?.set(pasteIntoOtherApps, forKey: Self.pasteIntoOtherAppsKey) }
     }
 
+    static let copyWhenNotInsertedKey = "dictation.copyWhenNotInserted.v1"
+    /// Puts a finished result on the clipboard when Finish neither inserted nor pasted it. Read at Finish; on when never set.
+    var copyWhenNotInserted: Bool {
+        didSet { defaults?.set(copyWhenNotInserted, forKey: Self.copyWhenNotInsertedKey) }
+    }
+
     var mode: DictationQuickMode {
         didSet { defaults?.set(mode.rawValue, forKey: Self.modeKey) }
     }
@@ -111,6 +117,11 @@ final class DictationPreferences {
             self.pasteIntoOtherApps = defaults.bool(forKey: Self.pasteIntoOtherAppsKey)
         } else {
             self.pasteIntoOtherApps = true
+        }
+        if let defaults, defaults.object(forKey: Self.copyWhenNotInsertedKey) != nil {
+            self.copyWhenNotInserted = defaults.bool(forKey: Self.copyWhenNotInsertedKey)
+        } else {
+            self.copyWhenNotInserted = true
         }
         let applications = DictationExclusionStorage.decode(DictationBlockedApplication.self,
             from: defaults?.data(forKey: Self.blockedApplicationsKey))

@@ -11,6 +11,12 @@ enum DictationFlowState: String, Sendable {
     case idle, starting, recording, paused, processing, ready, failed
 }
 
+/// What a processing Finish is doing, for the HUD title. Speech-model loading happens inside the backend's
+/// completion and is not reported to the coordinator, so it shows as transcribing.
+enum DictationProcessingPhase: Sendable {
+    case transcribing, cleaning, inserting
+}
+
 enum DictationCaptureStatus: Equatable, Sendable {
     case recording, paused
     case interrupted(String)
@@ -119,6 +125,12 @@ final class DictationCoordinator {
     private(set) var destinationLabel = "Copy after recording"
     private(set) var handle: DictationRecordingHandle?
     private(set) var wantsRecordingHUD = false
+    /// Set by the HUD's Dismiss, or after a delivered result was shown briefly. Keeps the HUD hidden for this take
+    /// until the next Start or another take.
+    private(set) var recordingHUDDismissed = false
+    /// The latest Finish confirmed an insertion or sent a paste, so its result needs no Copy.
+    private(set) var deliveredOnFinish = false
+    private(set) var processingPhase: DictationProcessingPhase = .transcribing
     let preferences: DictationPreferences
     private(set) var contextStatus = "Context off"
     private(set) var contextProfile: DictationContextProfile?
@@ -151,6 +163,13 @@ final class DictationCoordinator {
     private var delivering = false
     private var committingOutput = false
     @ObservationIgnored private var captureInterruption: String?
+    /// A Start/Finish press that arrived while Start was still opening the microphone; it finishes once recording begins.
+    @ObservationIgnored private var finishRequestedWhileStarting = false
+    /// How long a delivered result stays in the HUD before it hides; replaceable so tests need not wait.
+    @ObservationIgnored var recordingHUDAutoHideDelay: Duration = .milliseconds(1500)
+    @ObservationIgnored private var recordingHUDAutoHide: Task<Void, Never>?
+    /// The clipboard Copy writes to; replaceable so tests never touch the user's clipboard.
+    @ObservationIgnored var pasteboard: NSPasteboard = .general
     @ObservationIgnored private var pendingEdits: [UUID: DictationTextRevision] = [:]
     @ObservationIgnored private var editLearningSources: [UUID: DictationTextRevision] = [:]
     @ObservationIgnored private var editSaves: [UUID: Task<Void, Never>] = [:]
@@ -278,7 +297,9 @@ final class DictationCoordinator {
         switch state {
         case .idle, .ready, .failed: start()
         case .recording, .paused: finish()
-        case .starting, .processing: break
+        // A second press while the microphone is still opening must not be lost; it finishes once recording begins.
+        case .starting: finishRequestedWhileStarting = true
+        case .processing: break
         }
     }
 
@@ -286,6 +307,8 @@ final class DictationCoordinator {
 
     private func start(longRecording: Bool = false) {
         guard !reservesCapture, !isTransitioning else { return }
+        recordingHUDDismissed = false
+        recordingHUDAutoHide?.cancel()
         stopExternalCorrectionObservation()
         // Capture before presenting UI or requesting microphone permission changes focus.
         releaseTarget()
@@ -352,11 +375,15 @@ final class DictationCoordinator {
         transformPreview=nil; longTransformPreview=nil; previewSource=nil
         outputMode = .verbatim; outputVersions = []; activeOutputID = nil
         captureInterruption = nil
+        finishRequestedWhileStarting = false
+        deliveredOnFinish = false
         resultText = ""
         revision = nil
         handle = nil
         operation = Task { [weak self] in
             guard let self else { return }
+            // A failed or cancelled Start drops a remembered press with it.
+            defer { self.finishRequestedWhileStarting = false }
             do {
                 self.handle = try await self.backend.dictationBegin(mode: requestedMode)
                 if let handle = self.handle {
@@ -365,6 +392,7 @@ final class DictationCoordinator {
                 }
                 guard !Task.isCancelled, !self.cancelling else { return }
                 self.state = .recording
+                if self.finishRequestedWhileStarting { self.finish() }
             } catch {
                 guard !self.cancelling else { return }
                 let failure = error.localizedDescription
@@ -410,11 +438,14 @@ final class DictationCoordinator {
             clearCapturedContext()
             contextStatus = destinationBlocked ? "Context unavailable" : "Context expired"
         }
+        deliveredOnFinish = false
+        processingPhase = .transcribing
         state = .processing
         message = "Finishing the saved audio on this Mac…"
         operation = Task { [weak self] in
             guard let self else { return }
             var deliveryAttempted = false
+            var deliveryOutcome: DictationDeliveryOutcome?
             var observationContext: (DictationCapturedTarget, DictationTextRevision, UUID)?
             do {
                 defer {
@@ -435,6 +466,7 @@ final class DictationCoordinator {
                     // validator before Original/output versions commit and delivery may start.
                     let finishMode = requestedMode.outputMode
                     try self.requireCurrentOutput(source, handle: handle)
+                    self.processingPhase = .cleaning
                     self.message = finishMode == .email ?
                         "Formatting the saved transcript as an email on this Mac…" :
                         "Cleaning the saved transcript on this Mac…"
@@ -490,6 +522,7 @@ final class DictationCoordinator {
                     // Delivery owns the destination from here and releases it itself, so an interruption or
                     // shutdown during the write never releases a target mid-delivery.
                     self.target = nil
+                    self.processingPhase = .inserting
                     self.message = (target.strategy == .pasteFallback ? "Pasting into " : "Confirming insertion in ") +
                         target.descriptor.appName + "…"
                     // Exclusions as they are now: an app or website blocked during the recording is never written to.
@@ -503,6 +536,8 @@ final class DictationCoordinator {
                     case .targetChanged: status = .targetChanged
                     case .pasted: status = .pasted
                     }
+                    deliveryOutcome = receipt.outcome
+                    self.deliveredOnFinish = receipt.outcome == .confirmed || receipt.outcome == .pasted
                     self.message = receipt.message
                     let attempted = DictationDelivery(requestID: requestID, textRevisionID: output.id,
                         targetLabel: receipt.destination.appName, state: status, detail: receipt.message)
@@ -522,6 +557,12 @@ final class DictationCoordinator {
                         "Saved locally. Review or edit the text, then copy it."
                 }
                 self.state = .ready
+                if self.deliveredOnFinish {
+                    self.scheduleRecordingHUDAutoHide()
+                } else {
+                    self.copyIfNotInserted(after: deliveryOutcome,
+                                           confirmation: "Copied to the clipboard. Paste it where you want it.")
+                }
             } catch {
                 // Only a destination never handed to delivery is still held here.
                 self.releaseTarget()
@@ -550,6 +591,10 @@ final class DictationCoordinator {
                 if self.revision == nil {
                     try? await self.backend.dictationSave(handle, state: .failed, revision: nil, delivery: nil,
                         failure: error.localizedDescription)
+                } else if !deliveryAttempted {
+                    // Nothing was handed to the destination, so the saved text is copied like any other result.
+                    self.copyIfNotInserted(after: nil, confirmation: error.localizedDescription +
+                        " Copied to the clipboard. Paste it where you want it.")
                 }
             }
             if let (destination, source, deliveryID) = observationContext {
@@ -614,6 +659,8 @@ final class DictationCoordinator {
         guard !reservesCapture, !isTransitioning, let metadata = backend.dictationMetadata(handle) else { return }
         stopExternalCorrectionObservation()
         wantsRecordingHUD = false
+        recordingHUDDismissed = false
+        recordingHUDAutoHide?.cancel()
         transformPreview=nil; longTransformPreview=nil; previewSource=nil
         loadOutputMetadata(metadata)
         self.handle = handle
@@ -661,6 +708,7 @@ final class DictationCoordinator {
         stopExternalCorrectionObservation()
         clearCapturedContext()
         transformPreview=nil; longTransformPreview=nil; previewSource=nil
+        processingPhase = .transcribing
         state = .processing
         message = "Transcribing the selected audio on this Mac…"
         backend.dictationSetForegroundProcessing(handle, active: true)
@@ -842,6 +890,19 @@ final class DictationCoordinator {
     }
 
     func copyResult() {
+        copyResult(confirmation: "Copied. Your edited text is saved locally.", announces: false)
+    }
+
+    /// Finish inserted nothing: its result goes on the clipboard through Copy's own path when the preference allows.
+    /// An uncertain delivery is left alone: its text may have reached the destination, and a sent paste may have left
+    /// its own staged result on the clipboard. Long recordings stay in the editor.
+    private func copyIfNotInserted(after outcome: DictationDeliveryOutcome?, confirmation: String) {
+        guard preferences.copyWhenNotInserted, recordingPurpose == .quick, !Task.isCancelled,
+              outcome == nil || outcome == .failed || outcome == .targetChanged else { return }
+        copyResult(confirmation: confirmation, announces: true)
+    }
+
+    private func copyResult(confirmation: String, announces: Bool) {
         guard state == .ready, !isTransitioning, let handle, let revision,
               resultText.utf8.elementsEqual(revision.text.utf8),
               !resultText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
@@ -856,15 +917,38 @@ final class DictationCoordinator {
                 try await self.backend.dictationSave(handle, state: .ready, revision: revision, delivery: nil, failure: nil)
                 if self.pendingEdits[handle.takeID]?.id == revision.id { self.pendingEdits[handle.takeID] = nil }
                 try Task.checkCancellation()
-                NSPasteboard.general.clearContents()
-                guard NSPasteboard.general.setString(revision.text, forType: .string) else {
+                self.pasteboard.clearContents()
+                guard self.pasteboard.setString(revision.text, forType: .string) else {
                     throw KeystormError.message("The clipboard could not be written. Your text is saved locally.")
                 }
                 self.revision = revision
-                self.message = "Copied. Your edited text is saved locally."
+                self.message = confirmation
+                // A copy the user did not ask for is spoken; VoiceOver focus never reaches the HUD.
+                if announces, self.announcesStateChanges {
+                    self.spokenMessageRevision = self.messageRevision
+                    self.announceStatus(confirmation)
+                }
                 try await self.backend.dictationSave(handle, state: .ready, revision: revision,
                     delivery: DictationDelivery(requestID: UUID(), textRevisionID: revision.id, targetLabel: "Clipboard", state: .copied), failure: nil)
             } catch { self.message = error.localizedDescription }
+        }
+    }
+
+    /// The HUD's Dismiss keeps it hidden for this take; the next Start shows it again.
+    func dismissRecordingHUD() {
+        recordingHUDAutoHide?.cancel()
+        recordingHUDDismissed = true
+    }
+
+    /// After a confirmed insertion or a sent paste, the HUD shows the outcome briefly and then hides for this take.
+    private func scheduleRecordingHUDAutoHide() {
+        recordingHUDAutoHide?.cancel()
+        let delay = recordingHUDAutoHideDelay
+        let handle = handle
+        recordingHUDAutoHide = Task { [weak self] in
+            try? await Task.sleep(for: delay)
+            guard let self, !Task.isCancelled, self.handle == handle, self.state == .ready else { return }
+            self.recordingHUDDismissed = true
         }
     }
 
@@ -959,7 +1043,12 @@ final class DictationCoordinator {
 
     /// Explicit test/termination join; UI actions never overlap another transition.
     func waitUntilSettled() async {
-        await operation?.value
+        // An operation can start the next one (Finish after a press during Start, Copy after Finish); join each.
+        var joined: Task<Void, Never>?
+        while let current = operation, current != joined {
+            joined = current
+            await current.value
+        }
         await transformTask?.value
         await correctionSubmission?.value
         let pendingEdits = Array(editSaves.values)
