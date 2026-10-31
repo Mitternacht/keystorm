@@ -132,9 +132,32 @@ struct DictationCleanFinishTests {
         #expect(rig.backend.saved.allSatisfy { $0.delivery == nil })
     }
 
-    @Test("Failed local Clean keeps the durable raw transcript and never inserts a fallback",
-          arguments: [CleanFinishFault.worker, .malformedIdentity, .changedMeaning, .sourceChanged, .applyPersistence])
-    func invalidCleanNeverDelivers(_ fault: CleanFinishFault) async throws {
+    @Test("Failed local Clean falls back to inserting the durable raw transcript once and reports cleanup failed",
+          arguments: [CleanFinishFault.worker, .malformedIdentity, .changedMeaning, .applyPersistence])
+    func failedCleanInsertsRawTranscript(_ fault: CleanFinishFault) async throws {
+        let rig = CleanFinishRig(mode: .clean)
+        rig.backend.fault = fault
+        rig.coordinator.toggle()
+        await rig.coordinator.waitUntilSettled()
+        rig.coordinator.finish()
+        await rig.coordinator.waitUntilSettled()
+        #expect(rig.coordinator.state == .ready)
+        #expect(rig.coordinator.resultText == rig.backend.source.text)
+        #expect(rig.coordinator.outputMode == .verbatim)
+        #expect(rig.adapter.writes == [rig.backend.source.text])
+        #expect(rig.coordinator.cleanupFailureReason != nil)
+        #expect(rig.coordinator.message.contains("Cleanup failed"))
+        #expect(rig.backend.saved.compactMap(\.delivery?.state) == [.pending, .inserted])
+        #expect(rig.backend.metadata?.textRevision?.rawText == rig.backend.source.rawText)
+        #expect(rig.backend.metadata?.outputHistory == nil)
+        rig.coordinator.finish()
+        await rig.coordinator.waitUntilSettled()
+        #expect(rig.adapter.writes.count == 1)
+    }
+
+    @Test("A Clean source that changed underneath keeps the saved text and never inserts a stale fallback")
+    func staleCleanSourceNeverDelivers() async throws {
+        let fault = CleanFinishFault.sourceChanged
         let rig = CleanFinishRig(mode: .clean)
         rig.backend.fault = fault
         rig.coordinator.toggle()

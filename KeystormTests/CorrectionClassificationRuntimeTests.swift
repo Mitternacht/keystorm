@@ -5,6 +5,7 @@ import Testing
 struct CorrectionClassificationRuntimeTests {
     @Test("Installed Qwen classifies fixed terminology and wording-change fixtures",
         .enabled(if: ProcessInfo.processInfo.environment["KEYSTORM_RUN_LEARNING_CLASSIFIER"] == "1"),
+        .exclusiveModelUse,
         .timeLimit(.minutes(10)))
     func installedModelCorpus() async throws {
         let models = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,

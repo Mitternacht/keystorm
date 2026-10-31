@@ -6,6 +6,7 @@ import Testing
 struct DictationContextRuntimeTests {
     @Test("Actual local context stays untrusted and its excerpt is not persisted",
         .enabled(if: ProcessInfo.processInfo.environment["KEYSTORM_RUN_CONTEXT"] == "1"),
+        .exclusiveModelUse,
         .timeLimit(.minutes(10)))
     func installedContextCleanPersistence() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("Keystorm-Context-\(UUID().uuidString)")

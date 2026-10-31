@@ -143,7 +143,7 @@ enum InferenceWorkerDaemon {
                             throw KeystormError.message("Invalid bounded speech-worker request.")
                         }
                         reply.speech = try await engine.transcribeWindow(segments: request.segments,
-                            directory: directory, model: model)
+                            directory: directory, model: model, coreSegmentID: request.coreSegmentID)
                     case .transform:
                         guard let transform = request.transform,
                               transform.sourceText.utf8.count <= DictationTransformPolicy.maxSourceUTF8 else {

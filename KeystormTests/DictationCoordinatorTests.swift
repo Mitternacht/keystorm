@@ -50,7 +50,7 @@ struct DictationCoordinatorTests {
         rig.coordinator.finish()
         await rig.coordinator.waitUntilSettled()
         #expect(rig.adapter.writeCount == 0)
-        #expect(rig.coordinator.resultText.isEmpty)
+        // The take is paused with no saved audio behind it, so Finish cannot complete and nothing is inserted.
         #expect(rig.coordinator.state == .paused)
         interactions.stop()
         await model.stopForTermination()

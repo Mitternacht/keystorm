@@ -7,6 +7,7 @@ import Testing
 struct LearningApprovalRuntimeTests {
     @Test("Actual local AI candidates require approval before English/German reuse",
           .enabled(if: ProcessInfo.processInfo.environment["KEYSTORM_RUN_LEARNING_APPROVAL"] == "1"),
+          .exclusiveModelUse,
           .timeLimit(.minutes(10)))
     func installedModelReviewApproveAndReopen() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("Keystorm-Approval-\(UUID())")

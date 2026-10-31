@@ -54,6 +54,8 @@ final class LiveAudioBuffer: @unchecked Sendable {
     private let intervalID: UUID
     private let maximumPendingFrames: Int64
     private let usableFormat: Bool
+    /// Receives each processed buffer's loudness for the HUD level meter.
+    private let levelMeter: InputLevelMeter
     // Queue-confined state; never read or mutated by the capture callback.
     private var ring = LiveAudioRing(capacity: 16_000 * 12)
     private var processedEpoch: Int64 = -1
@@ -72,10 +74,12 @@ final class LiveAudioBuffer: @unchecked Sendable {
     private var outputScratch: AVAudioPCMBuffer?
     private var scratchBufferAllocations = 0
 
-    init(format: AVAudioFormat, intervalID: UUID, processingQueue: DispatchQueue? = nil) {
+    init(format: AVAudioFormat, intervalID: UUID, processingQueue: DispatchQueue? = nil,
+         levelMeter: InputLevelMeter = .shared) {
         queue = processingQueue ?? DispatchQueue(label: "Keystorm.live-audio-mirror", qos: .userInitiated)
         self.format = format
         self.intervalID = intervalID
+        self.levelMeter = levelMeter
         usableFormat = format.sampleRate.isFinite && (8_000...192_000).contains(format.sampleRate)
             && (1...8).contains(format.channelCount)
         maximumPendingFrames = usableFormat ? max(1, Int64(format.sampleRate * 0.75)) : 0
@@ -178,6 +182,8 @@ final class LiveAudioBuffer: @unchecked Sendable {
             guard state.accepting else { return }
             state.accepting = false
             state.epoch &+= 1
+            // A closed capture reads as silence at once, not after the stale timeout.
+            levelMeter.reset()
             queue.async { [self] in
                 reset(epoch: -1, start: 0)
                 ring.releaseStorage()
@@ -267,6 +273,7 @@ final class LiveAudioBuffer: @unchecked Sendable {
         guard count > 0 else { return 0 }
         let channelCount = Int(format.channelCount)
         if channelCount == 1, format.sampleRate == 16_000 {
+            publishLevel(channel(0), count: count)
             ring.append(UnsafeBufferPointer(start: channel(0), count: count))
             return count
         }
@@ -284,6 +291,7 @@ final class LiveAudioBuffer: @unchecked Sendable {
             vDSP_vsmul(destination, 1, &scale, destination, 1, vDSP_Length(count))
         }
         mono.frameLength = AVAudioFrameCount(count)
+        publishLevel(UnsafePointer(destination), count: count)
         if format.sampleRate == 16_000 {
             ring.append(UnsafeBufferPointer(start: destination, count: count))
             return count
@@ -322,6 +330,16 @@ final class LiveAudioBuffer: @unchecked Sendable {
         let convertedCount = Int(output.frameLength)
         ring.append(UnsafeBufferPointer(start: converted, count: convertedCount))
         return convertedCount
+    }
+
+    /// RMS and peak of one mono buffer. Two vDSP passes over at most a few thousand samples, on the mirror queue.
+    private func publishLevel(_ samples: UnsafePointer<Float>, count: Int) {
+        guard count > 0 else { return }
+        var rms: Float = 0
+        var peak: Float = 0
+        vDSP_rmsqv(samples, 1, &rms, vDSP_Length(count))
+        vDSP_maxmgv(samples, 1, &peak, vDSP_Length(count))
+        levelMeter.publish(rms: rms, peak: peak)
     }
 
     private func scratch(_ existing: inout AVAudioPCMBuffer?, format: AVAudioFormat,

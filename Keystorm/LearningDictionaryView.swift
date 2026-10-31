@@ -1,11 +1,44 @@
 import AppKit
 import SwiftUI
 
+/// The dictionary has two parts: words typed by hand, and corrections learned from edits.
 struct LearningDictionaryView: View {
+    let controller: LearningDictionaryController
+    private enum Tab: Hashable { case vocabulary, learned }
+    @State private var tab = Tab.vocabulary
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Picker("Dictionary section", selection: $tab) {
+                Text("My words").tag(Tab.vocabulary)
+                Text("Learned corrections").tag(Tab.learned)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .fixedSize()
+            .frame(maxWidth: .infinity)
+            .padding(.horizontal, 24)
+            .padding(.top, 8)
+            .accessibilityIdentifier("dictionary.section")
+            switch tab {
+            case .vocabulary: ManualVocabularyView(controller: controller)
+            case .learned: LearnedCorrectionsView(controller: controller)
+            }
+        }
+        .task { await controller.refresh() }
+        // Keyed on the report token, not the text: a repeated outcome or error is announced each time.
+        .onChange(of: controller.announcementToken) {
+            if let message = controller.announcement { AccessibilityNotification.Announcement(message).post() }
+        }
+        .frame(minWidth: 560, minHeight: 420)
+    }
+}
+
+private struct LearnedCorrectionsView: View {
     let controller: LearningDictionaryController
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 20) {
+        VStack(alignment: .leading, spacing: 24) {
             LearningDictionaryHeader(isEnabled: controller.isEnabled,
                 externalCorrectionsEnabled: controller.externalCorrectionsEnabled,
                 isClassifying: controller.isClassifying,
@@ -41,12 +74,6 @@ struct LearningDictionaryView: View {
             LearningDictionaryFooter()
         }
         .padding(24)
-        .task { await controller.refresh() }
-        // Keyed on the report token, not the text: a repeated outcome or error is announced each time.
-        .onChange(of: controller.announcementToken) {
-            if let message = controller.announcement { AccessibilityNotification.Announcement(message).post() }
-        }
-        .frame(minWidth: 560, minHeight: 420)
     }
 }
 
@@ -100,7 +127,7 @@ private struct LearnedTermRow: View {
     private var undoesLearning: Bool { entry.status == .learned || entry.status == .approved }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline) {
                 Text(entry.canonical).font(.headline)
                 Spacer()
@@ -146,7 +173,7 @@ private struct LearnedTermRow: View {
             .buttonStyle(.borderless)
             .font(.callout)
         }
-        .padding(.vertical, 10)
+        .padding(.vertical, 8)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("learning.term.\(entry.id.uuidString)")
     }

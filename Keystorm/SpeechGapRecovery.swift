@@ -19,6 +19,9 @@ enum SpeechGapRecovery {
               }) else {
             throw KeystormError.message("The local speech repair returned invalid timing for its own audio. Nothing was inserted.")
         }
+        // A fresh decoder on a short fragment can fall into a loop ("un precio de la precio de la precio"). Such
+        // words are invented, not recovered, so the gap stays open instead.
+        guard !hasDegenerateRepetition(words.map(\.word)) else { return [] }
         return words.compactMap { word in
             let start = repairStart + max(0, word.startTime)
             let end = repairStart + min(repairDuration, word.endTime)
@@ -27,6 +30,19 @@ enum SpeechGapRecovery {
             return TimedSpeechWord(word: word.word, startTime: max(ownedGap.lowerBound, start),
                                    endTime: min(ownedGap.upperBound, end))
         }
+    }
+
+    /// The same one to four words three times in a row, ignoring case and punctuation.
+    static func hasDegenerateRepetition(_ words: [String]) -> Bool {
+        let tokens = words.map { $0.lowercased().filter { $0.isLetter || $0.isNumber } }.filter { !$0.isEmpty }
+        for length in 1...4 where tokens.count >= length * 3 {
+            for start in 0...(tokens.count - length * 3) {
+                let first = tokens[start..<start + length]
+                if first.elementsEqual(tokens[start + length..<start + 2 * length]),
+                   first.elementsEqual(tokens[start + 2 * length..<start + 3 * length]) { return true }
+            }
+        }
+        return false
     }
 
     static func uncoveredSpeechRanges(samples: [Float], words: [TimedSpeechWord],

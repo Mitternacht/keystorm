@@ -8,19 +8,21 @@ import Testing
 struct DictationEmailTranslatePolicyTests {
     // MARK: Template provenance
 
-    /// Digests recorded from the unmodified templates before Email/Translate were added.
+    /// Digests recorded from the unmodified templates before Email/Translate were added. Clean was rewritten later.
     @Test func `Existing template digests and version are unchanged`() {
-        #expect(DictationTransformPolicy.templateVersion == 5)
+        #expect(DictationTransformPolicy.templateVersion == 9)
         #expect(DictationTransformPolicy.promptTemplateSHA256(for: .verbatim) ==
             "0cc755c0a3ed9c3c7984600761f0eaa6a85069d72e9d54903001646e83da8884")
-        #expect(DictationTransformPolicy.promptTemplateSHA256(for: .clean) ==
+        // Clean's template was rewritten in version 6 (it now removes fillers, repeats and self-corrections),
+        // so its old digests must no longer be accepted as current.
+        #expect(DictationTransformPolicy.promptTemplateSHA256(for: .clean) !=
             "870dbff7c6e78075357143652fd3d672a9834776d224011402328ea171cfd1a4")
         #expect(DictationTransformPolicy.promptTemplateSHA256(for: .summarize) ==
             "d45a68c78d465da1aedf13d23da42c30b1ef8f71f2dd4143a40d589b308f8e28")
         #expect(DictationTransformPolicy.promptTemplateSHA256(for: .organize) ==
             "1cc88217871222976dfd82e0d277592fb18fb654a45aab6c7534d5bbbd08895d")
         let context = DictationContextSnapshot(profile: .email, availability: .application)
-        #expect(DictationTransformPolicy.promptTemplateSHA256(for: .clean, context: context) ==
+        #expect(DictationTransformPolicy.promptTemplateSHA256(for: .clean, context: context) !=
             "e33c4bb8cc3259b180e656c7b7024c19403ae010d529e08e19c7fa3b2fe9ab1c")
     }
 
@@ -452,10 +454,34 @@ struct DictationEmailFinishTests {
         #expect(rig.adapter.writes == [rig.backend.emailText])
     }
 
-    @Test("Failed or unsafe Email keeps the durable raw transcript and never inserts a fallback",
+    @Test("Failed or unsafe Email falls back to inserting the durable raw transcript once and reports cleanup failed",
           arguments: [EmailFinishFault.worker, .malformedIdentity, .wrongMode, .addedGreeting, .addedSignOff,
-                      .translatedWord, .droppedNegation, .sourceChanged, .applyPersistence])
-    func invalidEmailNeverDelivers(_ fault: EmailFinishFault) async throws {
+                      .translatedWord, .droppedNegation, .applyPersistence])
+    func failedEmailInsertsRawTranscript(_ fault: EmailFinishFault) async throws {
+        let rig = EmailFinishRig(mode: .email)
+        rig.backend.fault = fault
+        rig.coordinator.toggle()
+        await rig.coordinator.waitUntilSettled()
+        rig.coordinator.finish()
+        await rig.coordinator.waitUntilSettled()
+        #expect(rig.coordinator.state == .ready)
+        #expect(rig.coordinator.resultText == rig.backend.source.text)
+        #expect(rig.coordinator.outputMode == .verbatim)
+        #expect(rig.adapter.writes == [rig.backend.source.text])
+        #expect(rig.coordinator.cleanupFailureReason != nil)
+        #expect(rig.coordinator.message.contains("Cleanup failed"))
+        #expect(rig.backend.saved.compactMap(\.delivery?.state) == [.pending, .inserted])
+        #expect(rig.backend.metadata?.textRevision?.rawText == rig.backend.source.rawText)
+        #expect(rig.backend.metadata?.outputHistory == nil)
+        #expect(rig.backend.count(.apply) == (fault == .applyPersistence ? 1 : 0))
+        rig.coordinator.finish()
+        await rig.coordinator.waitUntilSettled()
+        #expect(rig.adapter.writes.count == 1)
+    }
+
+    @Test("An Email source that changed underneath keeps the saved text and never inserts a stale fallback")
+    func staleEmailSourceNeverDelivers() async throws {
+        let fault = EmailFinishFault.sourceChanged
         let rig = EmailFinishRig(mode: .email)
         rig.backend.fault = fault
         rig.coordinator.toggle()

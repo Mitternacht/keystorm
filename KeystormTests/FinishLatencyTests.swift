@@ -17,6 +17,7 @@ import os
 struct FinishLatencyTests {
     @Test("File-fed Finish passes are timed against the engineering budgets",
           .enabled(if: ProcessInfo.processInfo.environment["KEYSTORM_RUN_FINISH_LATENCY"] == "1"),
+          .exclusiveModelUse,
           .timeLimit(.minutes(120)))
     func finishPassesAgainstBudgets() async throws {
         let environment = ProcessInfo.processInfo.environment

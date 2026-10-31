@@ -36,9 +36,9 @@ struct DictationBlockedAppsSection: View {
                 Text("Password managers: always blocked, can't be removed")
             }
             .accessibilityIdentifier("dictation.builtInExclusions")
+        } header: { Text("Blocked apps") } footer: {
             Text("Quick dictation doesn't start while a blocked app is in front, and Keystorm reads nothing from that app and pastes nothing into it. If a blocked app is in front when you finish, nothing is inserted and the result stays in Keystorm to copy. Long Recording, which records only into Keystorm, isn't affected.")
-                .font(.caption).foregroundStyle(.secondary)
-        } header: { Text("Blocked apps") }
+        }
     }
 }
 
@@ -74,13 +74,14 @@ struct DictationBlockedWebsitesSection: View {
             }
             if !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && draftDomain == nil {
                 Text("Enter a domain such as example.com. For international names, use the form that starts with xn--.")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .settingsNote()
             }
-            Text("Blocking a domain also blocks its subdomains. When you start, and again before pasting, Keystorm reads the address of the page you're typing in through Accessibility. The address is compared on this Mac and never saved. On a blocked website, dictation doesn't start.")
-                .font(.caption).foregroundStyle(.secondary)
-            Text("If the address can't be read, nothing is pasted and no context is used; the result stays in Keystorm to copy. Websites are checked only while Paste into other apps is on and Keystorm has Accessibility access, and only when something on the page has keyboard focus. Fields outside the page, such as the address bar, aren't part of a website.")
-                .font(.caption).foregroundStyle(.secondary)
-        } header: { Text("Blocked websites") }
+        } header: { Text("Blocked websites") } footer: {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Blocking a domain also blocks its subdomains. When you start, and again before pasting, Keystorm reads the address of the page you're typing in through Accessibility. The address is compared on this Mac and never saved. On a blocked website, dictation doesn't start.")
+                Text("If the address can't be read, nothing is pasted and no context is used; the result stays in Keystorm to copy. Websites are checked only while Paste into other apps is on and Keystorm has Accessibility access, and only when something on the page has keyboard focus. Fields outside the page, such as the address bar, aren't part of a website.")
+            }
+        }
     }
 
     private func add() {
@@ -167,7 +168,7 @@ struct DictationApplicationRow<Trailing: View>: View {
             VStack(alignment: .leading, spacing: 1) {
                 Text(verbatim: name)
                 Text(verbatim: bundleIdentifier)
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.footnote).foregroundStyle(.secondary)
                     .lineLimit(1).truncationMode(.middle)
             }
             .accessibilityElement(children: .combine)

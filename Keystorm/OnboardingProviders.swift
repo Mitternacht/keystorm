@@ -16,6 +16,16 @@ extension WorkspaceModel: OnboardingModelInstalling {
         onboardingModelsChecked && !isBusy && !isRecording && !isCaptureTransitioning
     }
 
+    /// Startup finished (`isBusy` is clear again) without a store, and said why: reading the saved state failed.
+    /// Before startup begins nothing has failed yet, so setup keeps showing Checking.
+    var onboardingModelsCheckFailure: String? {
+        _ = isBusy
+        guard store == nil, !isBusy else { return nil }
+        return error
+    }
+
+    func onboardingRetryModelsCheck() async { await initialize() }
+
     func onboardingIsInstalled(_ id: String) -> Bool { installedModelIDs.contains(id) }
 
     func onboardingInstallProgress(_ id: String) -> Double? { installProgress[id] }

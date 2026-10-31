@@ -385,8 +385,10 @@ struct OnboardingModelTests {
     @Test("Every other assigned global shortcut is listed, so none is active unexplained")
     func otherAssignedShortcutsAreListed() throws {
         let model = makeModel()
-        // The shipped defaults also bind developer-brief recording, which starts the microphone.
-        #expect(model.otherShortcutRows.map(\.action) == [.toggleRecording, .recordEdit])
+        // The shipped defaults bind no developer-brief recording shortcut; an existing user may still have one.
+        #expect(model.otherShortcutRows.isEmpty)
+        settings.bindings[.toggleRecording] = "⇧⌘Space"
+        #expect(model.otherShortcutRows.map(\.action) == [.toggleRecording])
         #expect(model.otherShortcutRows.allSatisfy { !OnboardingModel.explainedShortcuts.contains($0.action) })
 
         settings.bindings[.recordEdit] = nil
@@ -469,12 +471,12 @@ struct OnboardingModelTests {
         model.goBack()
         #expect(model.step == .models)
         for _ in OnboardingStep.allCases { model.goForward() }
-        #expect(model.step == .shortcuts)
+        #expect(model.step == .practice)
         #expect(model.isLastStep)
         model.goForward()
-        #expect(model.step == .shortcuts)
+        #expect(model.step == .practice)
         model.goBack()
-        #expect(model.step == .accessibility)
+        #expect(model.step == .shortcuts)
         #expect(model.canGoBack)
         #expect(!model.isLastStep)
     }

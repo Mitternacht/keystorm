@@ -90,6 +90,7 @@ struct InferenceWorkerTests {
 struct InferenceWorkerProcessTests {
     @Test("Private worker restarts after a crash and cancellation",
           .enabled(if: ProcessInfo.processInfo.environment["KEYSTORM_RUN_WORKER_SMOKE"] == "1"),
+          .exclusiveModelUse,
           .timeLimit(.minutes(2)))
     func privateProcessRecovery() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("Keystorm-Worker-\(UUID().uuidString)")

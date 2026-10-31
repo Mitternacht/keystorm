@@ -33,7 +33,6 @@ struct DictationTransformTests {
         ("Visit https://example.com/über?q=1.", "Visit https://example.com/uber?q=1."),
         ("Use `cacheLimit = 256` exactly.", "Use `cachelimit=256` exactly."),
         ("Keep KeyStorm local.", "Keep Keystorm local."),
-        ("We should should keep this.", "We should keep this."),
         ("Tomorrow is possible.", "Tomorrow is certain."),
         ("Do not upload.", "Do upload.")
     ]

@@ -13,18 +13,19 @@ struct OnboardingView: View {
     @Environment(\.dismissWindow) private var dismissWindow
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 0) {
-                OnboardingStepList(model: model)
-                    .frame(width: 220)
-                Divider()
-                ScrollView {
-                    OnboardingStepContent(model: model)
-                        .padding(28)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-            }
+        HStack(spacing: 0) {
+            OnboardingStepList(model: model)
+                .frame(width: 220)
             Divider()
+            ScrollView {
+                OnboardingStepContent(model: model)
+                    .padding(28)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .scrollEdgeEffectStyle(.soft, for: .bottom)
+        }
+        // The buttons float on glass over the content; the content scrolls beneath the bar.
+        .safeAreaBar(edge: .bottom) {
             OnboardingFooter(model: model) { dismissWindow(id: OnboardingWindow.id) }
         }
         .frame(minWidth: 680, idealWidth: 760, minHeight: 500, idealHeight: 580)
@@ -142,6 +143,7 @@ private struct OnboardingStepContent: View {
         case .microphone: OnboardingMicrophoneStep(model: model)
         case .accessibility: OnboardingAccessibilityStep(model: model)
         case .shortcuts: OnboardingShortcutsStep(model: model)
+        case .practice: OnboardingPracticeStep(model: model)
         }
     }
 }
@@ -151,43 +153,114 @@ private struct OnboardingFooter: View {
     let close: () -> Void
 
     var body: some View {
-        HStack(spacing: 10) {
-            if model.isFirstRun {
-                Button("Skip Setup") { model.skip(); close() }
-                    .help("Close setup. You can reopen it from the Keystorm menu.")
-                    .accessibilityHint("Closes setup. You can reopen it from the Keystorm menu.")
-                    .accessibilityIdentifier("onboarding.skip")
-            }
-            Spacer()
-            if model.canGoBack {
-                Button("Back") { model.goBack() }
-                    .accessibilityIdentifier("onboarding.back")
-            }
-            if model.isLastStep {
-                Button("Done") { model.finish(); close() }
-                    .keyboardShortcut(.defaultAction)
-                    .accessibilityIdentifier("onboarding.done")
-            } else {
-                Button("Continue") { model.goForward() }
-                    .keyboardShortcut(.defaultAction)
-                    .accessibilityIdentifier("onboarding.continue")
+        // Glass lives only on these floating controls. The container's spacing is below the stack spacing,
+        // so the shapes stay separate at rest.
+        GlassEffectContainer(spacing: 4) {
+            VStack(alignment: .trailing, spacing: 8) {
+                if model.isLastStep, let blocker = model.finishBlockers.first {
+                    // Done stays off until the microphone, speech model and Accessibility are ready.
+                    Button {
+                        model.step = blocker.step
+                    } label: {
+                        Label {
+                            Text(blocker.title)
+                                .lineLimit(2)
+                                .multilineTextAlignment(.leading)
+                        } icon: {
+                            Image(systemName: "exclamationmark.circle.fill")
+                                .foregroundStyle(.orange)
+                                .accessibilityHidden(true)
+                        }
+                    }
+                    .buttonStyle(.glass)
+                    .accessibilityHint("Opens the setup step that is still needed before you can finish.")
+                    .accessibilityIdentifier("onboarding.blocker")
+                }
+                HStack(spacing: 12) {
+                    if model.isFirstRun {
+                        Button("Skip Setup") { model.skip(); close() }
+                            .buttonStyle(.glass)
+                            .help("Close setup. You can reopen it from the Keystorm menu.")
+                            .accessibilityHint("Closes setup. You can reopen it from the Keystorm menu.")
+                            .accessibilityIdentifier("onboarding.skip")
+                    }
+                    Spacer(minLength: 12)
+                    OnboardingProgressCapsule(step: model.step)
+                    if model.canGoBack {
+                        Button("Back") { model.goBack() }
+                            .buttonStyle(.glass)
+                            .accessibilityIdentifier("onboarding.back")
+                    }
+                    // One prominent button per step: the way forward.
+                    if model.isLastStep {
+                        Button("Done") { model.finish(); close() }
+                            .buttonStyle(.glassProminent)
+                            .keyboardShortcut(.defaultAction)
+                            .disabled(!model.canFinish)
+                            .accessibilityIdentifier("onboarding.done")
+                    } else {
+                        Button("Continue") { model.goForward() }
+                            .buttonStyle(.glassProminent)
+                            .keyboardShortcut(.defaultAction)
+                            .accessibilityIdentifier("onboarding.continue")
+                    }
+                }
             }
         }
+        .controlSize(.large)
         .padding(.horizontal, 20)
-        .padding(.vertical, 14)
+        .padding(.vertical, 12)
+    }
+}
+
+/// Where the person is in setup: a short dot track plus "Step 2 of 5", on one glass capsule.
+private struct OnboardingProgressCapsule: View {
+    let step: OnboardingStep
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        let total = OnboardingStep.allCases.count
+        let current = step.rawValue + 1
+        HStack(spacing: 10) {
+            HStack(spacing: 5) {
+                ForEach(OnboardingStep.allCases) { item in
+                    Capsule()
+                        .fill(item == step ? Color.accentColor : Color.secondary.opacity(0.4))
+                        .frame(width: item == step ? 16 : 6, height: 6)
+                }
+            }
+            .accessibilityHidden(true)
+            Text("Step \(current) of \(total)")
+                .font(.caption.monospacedDigit())
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .glassEffect()
+        .animation(reduceMotion ? nil : .smooth, value: step)
+        .accessibilityElement(children: .combine)
     }
 }
 
 // MARK: Shared pieces
 
 private struct OnboardingStepHeader: View {
+    let systemImage: String
     let title: LocalizedStringResource
     let message: LocalizedStringResource
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 8) {
+            // The large symbol repeats the step in the sidebar; it is decoration for VoiceOver.
+            Image(systemName: systemImage)
+                .font(.largeTitle)
+                .imageScale(.large)
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(.tint)
+                .padding(.bottom, 4)
+                .accessibilityHidden(true)
             Text(title)
-                .font(.title2.bold())
+                .font(.title.bold())
                 .accessibilityAddTraits(.isHeader)
             Text(message)
                 .foregroundStyle(.secondary)
@@ -226,15 +299,18 @@ private struct OnboardingPoint: View {
     }
 }
 
-/// Buttons sit side by side, and stack when larger text no longer fits.
+/// Buttons sit side by side, and stack when larger text no longer fits. They are content-layer actions, so they
+/// use the standard bordered style; the glass buttons are the floating ones in the footer.
 private struct OnboardingButtonRow<Content: View>: View {
     @ViewBuilder let content: Content
 
     var body: some View {
         ViewThatFits(in: .horizontal) {
-            HStack(spacing: 10) { content }
+            HStack(spacing: 12) { content }
             VStack(alignment: .leading, spacing: 8) { content }
         }
+        .buttonStyle(.bordered)
+        .controlSize(.large)
     }
 }
 
@@ -245,8 +321,27 @@ private struct OnboardingModelsStep: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
-            OnboardingStepHeader(title: "Local models",
+            OnboardingStepHeader(systemImage: OnboardingStep.models.systemImage, title: "Local models",
                 message: "Installing downloads verified model files. Recording, transcription and text processing stay on this Mac.")
+            if let failure = model.modelCheckFailure {
+                // Startup could not read the installed models. Without this, the rows would say Checking for good.
+                GroupBox {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Label {
+                            Text("Keystorm couldn’t read the installed models: \(failure)")
+                                .fixedSize(horizontal: false, vertical: true)
+                        } icon: {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.orange)
+                                .accessibilityHidden(true)
+                        }
+                        Button("Check Again") { Task { await model.retryModelsCheck() } }
+                            .accessibilityIdentifier("onboarding.models.retry")
+                    }
+                    .padding(6)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
             ForEach(OnboardingModelKind.allCases) { kind in
                 OnboardingModelRow(kind: kind, state: model.state(of: kind), canInstall: model.canInstallModels) {
                     // Unstructured, so closing the window does not cancel a running download.
@@ -345,7 +440,7 @@ private struct OnboardingMicrophoneStep: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
-            OnboardingStepHeader(title: "Microphone",
+            OnboardingStepHeader(systemImage: OnboardingStep.microphone.systemImage, title: "Microphone",
                 message: "Keystorm uses the microphone only while you record. Recordings are saved and transcribed on this Mac.")
             OnboardingStatusLine(isSatisfied: model.microphone == .authorized, text: status)
             if let guidance {
@@ -393,7 +488,7 @@ private struct OnboardingAccessibilityStep: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
-            OnboardingStepHeader(title: "Accessibility",
+            OnboardingStepHeader(systemImage: OnboardingStep.accessibility.systemImage, title: "Accessibility",
                 message: "With Accessibility access, Keystorm can put finished dictation into the text field where you started. Without it, dictation is Copy-only.")
             OnboardingStatusLine(isSatisfied: model.accessibilityTrusted,
                 text: model.accessibilityTrusted ? "Accessibility access is on." : "Accessibility access is off, so dictation is Copy-only.")
@@ -453,7 +548,7 @@ private struct OnboardingShortcutsStep: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
-            OnboardingStepHeader(title: "Shortcuts",
+            OnboardingStepHeader(systemImage: OnboardingStep.shortcuts.systemImage, title: "Shortcuts",
                 message: "These shortcuts work in any app while Keystorm is running, even when its window is closed.")
             GroupBox {
                 VStack(alignment: .leading, spacing: 10) {
@@ -496,6 +591,57 @@ private struct OnboardingShortcutsStep: View {
     }
 }
 
+/// The last step: dictate into a field inside this window, so the whole path is tried before Done.
+private struct OnboardingPracticeStep: View {
+    @Bindable var model: OnboardingModel
+    @FocusState private var fieldFocused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            OnboardingStepHeader(systemImage: OnboardingStep.practice.systemImage, title: "Try it",
+                message: "Click in the box, press your dictation shortcut, say a sentence, and press the shortcut again.")
+            if let shortcut = model.dictationShortcut {
+                Text("Your shortcut: \(shortcut)")
+                    .font(.headline)
+            } else {
+                Text("No dictation shortcut is assigned. Start dictation from the Keystorm menu bar icon.")
+                    .font(.headline)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            TextEditor(text: $model.practiceText)
+                .focused($fieldFocused)
+                .font(.body)
+                .frame(minHeight: 120)
+                // A normal content field on a standard text background, not glass. The outline turns accent
+                // while it has focus.
+                .scrollContentBackground(.hidden)
+                .padding(8)
+                .background(Color(nsColor: .textBackgroundColor), in: .rect(cornerRadius: 10))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10)
+                        .strokeBorder(fieldFocused ? AnyShapeStyle(.tint) : AnyShapeStyle(.separator),
+                                      lineWidth: fieldFocused ? 2 : 1)
+                }
+                .accessibilityLabel("Practice text field")
+                .accessibilityHint("Press your dictation shortcut and speak. The text appears here.")
+                .accessibilityIdentifier("onboarding.practice.field")
+            OnboardingStatusLine(isSatisfied: model.status(of: .practice) == .complete,
+                text: model.status(of: .practice) == .complete ? "Dictation reached the field." : "Nothing dictated yet.")
+            if model.deliveryMode == .copyOnly {
+                Text("Accessibility access is off, so finished dictation is copied instead of inserted. Press ⌘V in the box to paste it.")
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if !model.isReadyToDictate {
+                Text("Dictation needs the speech model and microphone access first. Go back to those steps.")
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .onAppear { fieldFocused = true }
+    }
+}
+
 private struct OnboardingShortcutLine: View {
     let row: OnboardingShortcutRow
 
@@ -503,7 +649,12 @@ private struct OnboardingShortcutLine: View {
         VStack(alignment: .leading, spacing: 4) {
             LabeledContent {
                 if let binding = row.binding {
-                    Text(binding).font(.body.weight(.semibold))
+                    // Keycap: a quiet filled capsule on the content layer, not glass.
+                    Text(binding)
+                        .font(.body.weight(.semibold))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 2)
+                        .background(.quaternary, in: .rect(cornerRadius: 6))
                 } else {
                     Text("Not assigned").foregroundStyle(.secondary)
                 }
@@ -684,6 +835,16 @@ private func previewOnboarding(models: PreviewOnboardingModels? = nil,
             .padding(28)
     }
     .frame(width: 540, height: 620)
+}
+
+#Preview("Practice") {
+    ScrollView {
+        OnboardingPracticeStep(model: previewOnboarding(
+            models: PreviewOnboardingModels(installed: [ModelCatalog.primarySpeech.id]),
+            microphone: .authorized, trusted: true))
+            .padding(28)
+    }
+    .frame(width: 540, height: 480)
 }
 
 #Preview("Shortcuts and summary") {

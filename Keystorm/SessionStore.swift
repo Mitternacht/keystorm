@@ -530,6 +530,84 @@ actor SessionStore {
         return (reports, blocked)
     }
 
+    // MARK: Dictation history search, deletion and retention
+
+    /// Matches saved dictations by title and transcript text, newest first.
+    func searchHistory(_ query: String, limit: Int = 50) throws -> [DictationHistoryHeader] {
+        try catalog.withHistory { try $0.search(query, limit: limit) }
+    }
+
+    /// Every session that owns an indexed dictation. Developer briefs are not included.
+    func dictationSessionIDs(limit: Int = 500) throws -> [UUID] {
+        try catalog.withHistory { try $0.dictationSessionIDs(limit: limit) }
+    }
+
+    /// Finished dictation sessions whose newest take is older than `cutoff`. A session that is capturing,
+    /// paused, captured or processing is never listed.
+    func finishedDictationSessionIDs(newestBefore cutoff: Date, readyOnly: Bool = false, limit: Int = 200) throws -> [UUID] {
+        try catalog.withHistory { try $0.finishedSessionIDs(newestBefore: cutoff, readyOnly: readyOnly, limit: limit) }
+    }
+
+    /// Permanently removes one session: its folder with audio and checkpoint, its catalog payload, capture
+    /// journal and history index rows. The folder is renamed out of Sessions first, so a failed catalog
+    /// transaction restores it and a failed final delete cannot make recovery adopt it again.
+    func deleteSession(_ id: UUID) throws {
+        appendCache = nil
+        let directory = root.appendingPathComponent("Sessions", isDirectory: true)
+            .appendingPathComponent(id.uuidString, isDirectory: true)
+        try requireContained(directory)
+        let graveyard = root.appendingPathComponent(".pending-deletion", isDirectory: true)
+        var moved: URL?
+        var attributes = stat()
+        if lstat(directory.path, &attributes) == 0 {
+            try FileManager.default.createDirectory(at: graveyard, withIntermediateDirectories: true)
+            let target = graveyard.appendingPathComponent(id.uuidString + "-" + UUID().uuidString, isDirectory: true)
+            try FileManager.default.moveItem(at: directory, to: target)
+            moved = target
+        }
+        do { try catalog.deleteSession(id) }
+        catch {
+            if let moved { try? FileManager.default.moveItem(at: moved, to: directory) }
+            throw error
+        }
+        // Best effort: leftovers are outside Sessions, so nothing reads them, and the next deletion retries.
+        for leftover in (try? FileManager.default.contentsOfDirectory(at: graveyard, includingPropertiesForKeys: nil)) ?? [] {
+            try? FileManager.default.removeItem(at: leftover)
+        }
+    }
+
+    /// Deletes a finished dictation's audio files but keeps its transcript and history entry. The audio is
+    /// recorded as unavailable with the same gap text recovery writes for a missing file, so opening the
+    /// recording later changes nothing. Returns the updated session, or nil when there was nothing safe to do.
+    func discardAudio(sessionID id: UUID) throws -> VoiceSession? {
+        appendCache = nil
+        // Reading a session by identity creates its folder, so an unknown identity is ruled out first.
+        let directory = root.appendingPathComponent("Sessions", isDirectory: true)
+            .appendingPathComponent(id.uuidString, isDirectory: true)
+            .appendingPathComponent("Audio", isDirectory: true)
+        try requireContained(directory)
+        guard FileManager.default.fileExists(atPath: directory.path), let entry = try currentEntry(id) else { return nil }
+        var session = entry.session
+        guard session.status != .recording, !session.segments.isEmpty,
+              let recordings = session.dictation?.recordings, !recordings.isEmpty,
+              recordings.allSatisfy({ $0.state == .ready }) else { return nil }
+        let files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        guard !files.isEmpty else { return nil }
+        for file in files {
+            try requireContained(file)
+            try FileManager.default.removeItem(at: file)
+        }
+        var unavailable = Set(session.unavailableSegmentIDs)
+        for segment in session.segments where unavailable.insert(segment.id).inserted {
+            addGap("Audio \(segment.id.uuidString) is unavailable: File is missing.", to: &session,
+                   from: segment.committedAt, segmentIDs: [segment.id], intervalIDs: [segment.intervalID])
+        }
+        session.unavailableSegmentIDs = unavailable.sorted { $0.uuidString < $1.uuidString }
+        session.updatedAt = Date()
+        try save(session)
+        return session
+    }
+
     func loadDictionary() throws -> [DictionaryEntry] {
         guard let data = try catalog.metadata("dictionary") else { return [] }
         return try decoder.decode([DictionaryEntry].self, from: data)
@@ -565,9 +643,15 @@ actor SessionStore {
             guard var entry = loaded.entries[id] else { continue }
             var session = entry.session
             let original = session
+            var deferredInterruptionGap: Date?
             if session.status == .recording {
                 session.status = .interrupted
-                addGap("Recording was interrupted. Audio after the last acknowledged segment may be missing.", to: &session, from: session.updatedAt)
+                if session.dictation == nil {
+                    addGap("Recording was interrupted. Audio after the last acknowledged segment may be missing.", to: &session, from: session.updatedAt)
+                } else {
+                    // A dictation can still finish with the audio it saved, so its gap waits until the tail was inspected.
+                    deferredInterruptionGap = session.updatedAt
+                }
                 reports.append("\(session.title): interrupted recording recovered.")
             }
             if var brief = session.brief {
@@ -627,9 +711,25 @@ actor SessionStore {
                     reports.append("\(session.title): \(reason)")
                 }
             }
+            // A crash or force quit leaves the writer's open segment as `<id>.partial.caf`: up to its 5 s rotation of
+            // speech that was never acknowledged. Rebuild each readable tail into a committed segment.
+            var salvagedTails = Set<String>()
+            for tail in files.filter({ $0.lastPathComponent.hasSuffix(Self.partialSuffix) })
+                .sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+                try Task.checkCancellation()
+                let stem = String(tail.lastPathComponent.dropLast(Self.partialSuffix.count))
+                if let tailID = UUID(uuidString: stem), session.segments.contains(where: { $0.id == tailID }) {
+                    // An earlier recovery already committed this tail; only its renamed original may be missing.
+                    salvagedTails.insert(tail.lastPathComponent)
+                    continue
+                }
+                guard let segment = try salvagePartialTail(tail, in: directory, session: &session) else { continue }
+                salvagedTails.insert(tail.lastPathComponent)
+                reports.append("\(session.title): recovered \(String(format: "%.1f", segment.duration)) s of audio from an unfinished segment.")
+            }
             let fileNames = Set(files.map(\.lastPathComponent))
             let committedNames = Set(session.segments.map(\.fileName))
-            for file in files {
+            for file in files where !salvagedTails.contains(file.lastPathComponent) {
                 let isTail = file.pathExtension == "partial" || file.pathExtension == "tmp"
                 let hasNoSidecar = file.pathExtension == "caf" &&
                     !fileNames.contains(file.deletingPathExtension().lastPathComponent + ".json") &&
@@ -638,6 +738,15 @@ actor SessionStore {
                     let reason = "Incomplete audio tail \(file.lastPathComponent) retained for inspection; it is not acknowledged audio."
                     addGap(reason, to: &session)
                     reports.append("\(session.title): \(reason)")
+                }
+            }
+            if let interruptedAt = deferredInterruptionGap {
+                if let open = session.intervals.last(where: { $0.endedAt == nil }),
+                   session.segments.contains(where: { $0.intervalID == open.id }) {
+                    // The open interval kept its audio, so the dictation can finish. At most the last moment is missing.
+                    reports.append("\(session.title): saved audio was kept; anything said just before the interruption may be missing.")
+                } else {
+                    addGap("Recording was interrupted. Audio after the last acknowledged segment may be missing.", to: &session, from: interruptedAt)
                 }
             }
             session.segments.sort { $0.startTime < $1.startTime }
@@ -683,6 +792,98 @@ actor SessionStore {
         }) else { return }
         session.gaps.append(SessionGap(startedAt: date ?? session.updatedAt, endedAt: Date(), reason: reason,
                                       segmentIDs: segmentIDs, intervalIDs: intervalIDs))
+    }
+
+    private static let partialSuffix = ".partial.caf"
+    /// The writer rotates segments at 5 s, so a tail much longer than that is not one of its own files.
+    private static let maximumSalvagedTailSeconds = 30.0
+
+    /// Rebuilds a crash-orphaned `<id>.partial.caf` into a committed segment: a finalized CAF, its sidecar, and an
+    /// entry in `session.segments` at the end of the interval that was open when the app died. The original tail is
+    /// kept beside it under a renamed extension. Returns nil, touching nothing, when the tail cannot be read or
+    /// placed without ambiguity, which leaves it to the usual "incomplete tail" gap.
+    private func salvagePartialTail(_ tail: URL, in directory: URL, session: inout VoiceSession) throws -> AudioSegment? {
+        let stem = String(tail.lastPathComponent.dropLast(Self.partialSuffix.count))
+        guard let id = UUID(uuidString: stem), !session.segments.contains(where: { $0.id == id }),
+              let interval = session.intervals.last(where: { $0.endedAt == nil }) else { return nil }
+        let final = directory.appendingPathComponent("\(id.uuidString).caf")
+        let staging = directory.appendingPathComponent("\(id.uuidString).salvage.caf")
+        let sidecar = directory.appendingPathComponent("\(id.uuidString).json")
+        let sidecarStaging = directory.appendingPathComponent("\(id.uuidString).json.tmp")
+        let fileManager = FileManager.default
+        guard !fileManager.fileExists(atPath: final.path), !fileManager.fileExists(atPath: sidecar.path) else { return nil }
+        // Both are this routine's own leftovers from an interrupted earlier attempt.
+        try? fileManager.removeItem(at: staging)
+        try? fileManager.removeItem(at: sidecarStaging)
+
+        let source: AVAudioFile
+        do { source = try AVAudioFile(forReading: tail) } catch { return nil }
+        defer { source.close() }
+        let format = source.processingFormat
+        let siblings = session.segments.filter { $0.intervalID == interval.id }
+        guard source.length > 0, format.sampleRate > 0, format.channelCount > 0,
+              Double(source.length) / format.sampleRate <= Self.maximumSalvagedTailSeconds,
+              siblings.allSatisfy({ abs($0.sampleRate - format.sampleRate) < 0.001 && $0.channelCount == Int(format.channelCount) }),
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 16_384) else { return nil }
+
+        var written: Int64 = 0
+        do {
+            let output = try AVAudioFile(forWriting: staging, settings: source.fileFormat.settings,
+                                         commonFormat: format.commonFormat, interleaved: format.isInterleaved)
+            // A tail that was never closed can end mid-chunk; keep whatever reads cleanly.
+            while source.framePosition < source.length {
+                let remaining = source.length - source.framePosition
+                do { try source.read(into: buffer, frameCount: AVAudioFrameCount(min(Int64(buffer.frameCapacity), remaining))) }
+                catch { break }
+                guard buffer.frameLength > 0 else { break }
+                try output.write(from: buffer)
+                written += Int64(buffer.frameLength)
+            }
+            output.close()
+        } catch {
+            try? fileManager.removeItem(at: staging)
+            return nil
+        }
+        guard written > 0 else {
+            try? fileManager.removeItem(at: staging)
+            return nil
+        }
+
+        // Timeline: right after this interval's last committed audio, or after everything saved so far.
+        let startTime = siblings.map(\.endTime).max() ?? session.recordedDuration
+        do {
+            try CaptureDurability.synchronize(staging)
+            let hash = try CaptureDurability.sha256(staging)
+            let segment = AudioSegment(id: id, intervalID: interval.id, fileName: final.lastPathComponent,
+                startTime: startTime, frameCount: written, sampleRate: format.sampleRate,
+                channelCount: Int(format.channelCount), sha256: hash)
+            guard !session.segments.contains(where: { Self.overlaps($0, segment) }) else {
+                try? fileManager.removeItem(at: staging)
+                return nil
+            }
+            try validateAudio(segment, at: staging)
+            try fileManager.moveItem(at: staging, to: final)
+            do {
+                try JSONEncoder().encode(segment).write(to: sidecarStaging, options: .withoutOverwriting)
+                try CaptureDurability.synchronize(sidecarStaging)
+                try fileManager.moveItem(at: sidecarStaging, to: sidecar)
+                try CaptureDurability.synchronizeDirectory(directory)
+            } catch {
+                // Without its sidecar the new file would look like unexplained audio; take it back.
+                try? fileManager.removeItem(at: sidecarStaging)
+                try? fileManager.removeItem(at: final)
+                return nil
+            }
+            // Keep the original evidence, out of the way of tail detection and of the next recovery.
+            try? fileManager.moveItem(at: tail, to: tail.appendingPathExtension("salvaged"))
+            session.segments.append(segment)
+            return segment
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            try? fileManager.removeItem(at: staging)
+            return nil
+        }
     }
 
     private func validateAudio(_ segment: AudioSegment, sessionID: UUID) throws {
@@ -1062,6 +1263,30 @@ private final class SQLiteCatalog: @unchecked Sendable {
     func markHistoryRepair(_ id: UUID, reason: String) throws {
         guard let connection else { throw failure() }
         try DictationHistoryRepository(connection: connection).markRepair(id, reason: reason)
+    }
+
+    func withHistory<T>(_ body: (DictationHistoryRepository) throws -> T) throws -> T {
+        guard let connection else { throw failure() }
+        return try body(DictationHistoryRepository(connection: connection))
+    }
+
+    /// One transaction removes the payload, capture journal, history headers and the dictation index rows.
+    func deleteSession(_ id: UUID) throws {
+        guard let connection else { throw failure() }
+        try execute("BEGIN IMMEDIATE")
+        do {
+            for sql in ["DELETE FROM sessions WHERE id=?",
+                        "DELETE FROM session_capture_journal WHERE session_id=?",
+                        "DELETE FROM session_capture_sources WHERE session_id=?",
+                        "DELETE FROM session_history_headers WHERE session_id=?"] {
+                let query = try statement(sql)
+                defer { sqlite3_finalize(query) }
+                try bind(id.uuidString, at: 1, to: query)
+                guard sqlite3_step(query) == SQLITE_DONE else { throw failure() }
+            }
+            try DictationHistoryRepository(connection: connection).forgetSession(id)
+            try execute("COMMIT")
+        } catch { try? execute("ROLLBACK"); throw error }
     }
 
     func dataVersion() throws -> Int32 { try scalar("PRAGMA data_version") }

@@ -75,6 +75,20 @@ final class DictationPreferences {
         didSet { defaults?.set(copyWhenNotInserted, forKey: Self.copyWhenNotInsertedKey) }
     }
 
+    static let spokenFormattingCommandsKey = "dictation.spokenFormattingCommands.v1"
+    /// Turns spoken punctuation and line-break commands ("comma", "new line", "Komma", "Absatz") into symbols with
+    /// `DictationSpokenFormatting`, instantly and without a text model, in every mode. On when never set.
+    var spokenFormattingCommands: Bool {
+        didSet { defaults?.set(spokenFormattingCommands, forKey: Self.spokenFormattingCommandsKey) }
+    }
+
+    /// How long the inference worker keeps its models loaded after the last job. The worker reads
+    /// this key itself (`ModelResidencyPolicy.storageKey`), so a change applies without a restart.
+    /// 15 minutes when never set.
+    var keepModelLoaded: ModelResidencyPolicy {
+        didSet { keepModelLoaded.store(in: defaults) }
+    }
+
     var mode: DictationQuickMode {
         didSet { defaults?.set(mode.rawValue, forKey: Self.modeKey) }
     }
@@ -109,6 +123,7 @@ final class DictationPreferences {
         self.defaults = defaults
         let storedMode = defaults?.string(forKey: Self.modeKey)
         self.mode = storedMode.flatMap(DictationQuickMode.init(rawValue:)) ?? .verbatim
+        self.keepModelLoaded = ModelResidencyPolicy.stored(in: defaults)
         self.contextMode = defaults?.string(forKey: Self.contextModeKey)
             .flatMap(DictationContextMode.init(rawValue:)) ?? .off
         self.contextProfile = defaults?.string(forKey: Self.contextProfileKey)
@@ -122,6 +137,11 @@ final class DictationPreferences {
             self.copyWhenNotInserted = defaults.bool(forKey: Self.copyWhenNotInsertedKey)
         } else {
             self.copyWhenNotInserted = true
+        }
+        if let defaults, defaults.object(forKey: Self.spokenFormattingCommandsKey) != nil {
+            self.spokenFormattingCommands = defaults.bool(forKey: Self.spokenFormattingCommandsKey)
+        } else {
+            self.spokenFormattingCommands = true
         }
         let applications = DictationExclusionStorage.decode(DictationBlockedApplication.self,
             from: defaults?.data(forKey: Self.blockedApplicationsKey))

@@ -26,4 +26,21 @@ struct LocalGrammarCacheTests {
         #expect(replacementCache.statistics()["grammarSchemaCompilations"] == 0)
         #expect(replacementCache.statistics()["grammarMatchersCreated"] == 0)
     }
+
+    @Test("Priming compiles ahead, hands out nothing, and the next job reuses that work")
+    func primingCompilesAhead() throws {
+        let tokenizer = try GrammarTokenizer(
+            vocab: ["{", "}", "\"", ":", ",", "true", "false", "[", "]", "<eos>"],
+            vocabType: .raw, eosTokenId: 9)
+        let cache = LocalGrammarCache(tokenizer: tokenizer)
+        try cache.prime(.dictationTransform)
+        try cache.prime(.dictationTransform)
+        #expect(cache.statistics()["grammarSchemaCompilations"] == 1)
+        #expect(cache.statistics()["grammarMatchersCreated"] == 0)
+        let initial = try LocalGrammarCache(tokenizer: tokenizer).constraint(for: .dictationTransform).computeMask().mask
+        let first = try cache.constraint(for: .dictationTransform)
+        #expect(try first.computeMask().mask == initial)
+        #expect(cache.statistics()["grammarSchemaCompilations"] == 1)
+        #expect(cache.statistics()["grammarMatchersCreated"] == 1)
+    }
 }

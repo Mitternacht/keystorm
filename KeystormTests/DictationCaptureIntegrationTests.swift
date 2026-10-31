@@ -10,6 +10,7 @@ struct DictationCaptureIntegrationTests {
     /// Existing permission is required; the test never requests a permission prompt.
     @Test("The real microphone tap resumes one durable dictation take",
           .enabled(if: ProcessInfo.processInfo.environment["KEYSTORM_RUN_DICTATION_CAPTURE"] == "1"),
+          .exclusiveModelUse,
           .timeLimit(.minutes(3)))
     func authorizedMicrophonePauseResume() async throws {
         let authorization = AVCaptureDevice.authorizationStatus(for: .audio)
@@ -114,6 +115,7 @@ struct DictationCaptureIntegrationTests {
 
     @Test("Production dictation completion reconciles saved bilingual writer audio and persists its result",
           .enabled(if: ProcessInfo.processInfo.environment["KEYSTORM_RUN_DICTATION_BACKEND_ASR"] == "1"),
+          .exclusiveModelUse,
           .timeLimit(.minutes(10)))
     func savedBilingualAudioCompletesThroughWorkspaceBackend() async throws {
         let reportURL = try fixtureReportURL()

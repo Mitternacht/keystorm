@@ -1,5 +1,6 @@
 import AppKit
 import Observation
+import UniformTypeIdentifiers
 
 /// Capture commands shared by the legacy brief shortcuts and hold coordinator.
 /// This boundary also lets interaction tests verify ownership without opening a microphone.
@@ -20,9 +21,12 @@ extension WorkspaceModel: LegacyRecordingBackend {}
 
 @MainActor @Observable
 final class AppInteractionController {
-    let shortcuts = ShortcutManager()
+    let shortcuts: ShortcutManager
     let readback = BriefReadback()
     private(set) var dictation: DictationCoordinator?
+    /// Watches Escape only while a dictation is starting, recording or paused. `configure` creates the real one when
+    /// shortcuts are started; tests assign a fake before `configure`.
+    @ObservationIgnored var escapeWatcher: (any EscapeKeyWatching)?
     @ObservationIgnored private var dictationHUD: DictationHUDController?
     @ObservationIgnored private weak var workspace: WorkspaceModel?
     @ObservationIgnored var showWorkspace: (@MainActor @Sendable () -> Void)?
@@ -33,6 +37,11 @@ final class AppInteractionController {
     @ObservationIgnored private var recordingHUD: RecordingHUDController?
     @ObservationIgnored private var recordingHUDObservation: UUID?
     private(set) var readbackBlockRanges: [UUID: NSRange] = [:]
+
+    /// Tests pass a shortcut manager with a private defaults suite so preferences never reach the real ones.
+    init(shortcuts: ShortcutManager? = nil) {
+        self.shortcuts = shortcuts ?? ShortcutManager()
+    }
 
     func configure(workspace: WorkspaceModel, showWorkspace: @escaping @MainActor @Sendable () -> Void,
                    dictation injectedDictation: DictationCoordinator? = nil,
@@ -78,10 +87,125 @@ final class AppInteractionController {
             self.perform(action)
         }
         shortcuts.onHoldRecording = { [weak self] pressed in self?.handleHold(pressed) }
+        shortcuts.isDictationActive = { [weak self] in self?.dictationAcceptsFinish == true }
+        shortcuts.onDictationCommand = { [weak self] command in self?.handleDictationCommand(command) }
+        var escape = escapeWatcher
+        #if DEBUG
+        let uiTesting = ProcessInfo.processInfo.environment["KEYSTORM_UI_TEST_ROOT"] != nil
+        #else
+        let uiTesting = false
+        #endif
+        // The real Escape hotkey only exists when real shortcuts do, so tests never claim Escape on this Mac.
+        if escape == nil, startShortcuts, !uiTesting { escape = EscapeCancelHotkey() }
+        escape?.onEscape = { [weak self] in self?.cancelDictationFromEscape() }
+        escapeWatcher = escape
         #if DEBUG
         if ProcessInfo.processInfo.environment["KEYSTORM_UI_TEST_ROOT"] != nil { return }
         #endif
         if startShortcuts { shortcuts.start() }
+        #if DEBUG
+        startDebugAutoTakeIfRequested()
+        #endif
+    }
+
+    #if DEBUG
+    /// Isolated file-audio runs only: `KEYSTORM_DEBUG_AUTOTAKE=<seconds>` starts one take once the workspace has
+    /// opened, finishes it after that many seconds and logs the outcome. `KEYSTORM_DEBUG_AUTOTAKE_QUIT=1` then quits.
+    /// It drives the same coordinator calls as the shortcut, so a crash soak does not need synthetic key events.
+    private func startDebugAutoTakeIfRequested() {
+        let environment = ProcessInfo.processInfo.environment
+        guard let recordSeconds = environment["KEYSTORM_DEBUG_AUTOTAKE"].flatMap(Double.init), recordSeconds > 0,
+              let configuration = try? DebugAudioValidationConfiguration.configuration() else { return }
+        let quits = environment["KEYSTORM_DEBUG_AUTOTAKE_QUIT"] == "1"
+        Task { @MainActor [weak self] in
+            @MainActor func wait(for states: Set<DictationFlowState>, seconds: Double) async -> Bool {
+                let deadline = ContinuousClock.now + .seconds(seconds)
+                while ContinuousClock.now < deadline {
+                    if let state = self?.dictation?.state, states.contains(state) { return true }
+                    try? await Task.sleep(for: .milliseconds(100))
+                }
+                return false
+            }
+            try? await Task.sleep(for: .seconds(6))
+            guard let dictation = self?.dictation else { return }
+            // Whatever field is focused elsewhere decides where Finish would write, and a protected one refuses
+            // Start. Accuracy runs measure the text, so they bring Keystorm itself to the front.
+            if environment["KEYSTORM_DEBUG_AUTOTAKE_ACTIVATE"] == "1" {
+                NSApp.activate()
+                try? await Task.sleep(for: .milliseconds(600))
+            }
+            if environment["KEYSTORM_DEBUG_AUTOTAKE_SETTINGS"] == "1" {
+                NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+            }
+            // Take the mode for this run only; the stored preference is put back before the process exits.
+            let storedMode = dictation.preferences.mode
+            // The finished text must not land on the real clipboard during a run.
+            let storedCopy = dictation.preferences.copyWhenNotInserted
+            dictation.preferences.copyWhenNotInserted = false
+            if let name = environment["KEYSTORM_DEBUG_AUTOTAKE_MODE"], let mode = DictationQuickMode(rawValue: name) {
+                dictation.preferences.mode = mode
+            }
+            dictation.toggle()
+            guard await wait(for: [.recording], seconds: 30) else {
+                configuration.log("autotake-no-recording", fields: ["state": dictation.state.rawValue,
+                    "message": dictation.message])
+                dictation.preferences.mode = storedMode
+                dictation.preferences.copyWhenNotInserted = storedCopy
+                if quits { exit(0) }
+                return
+            }
+            // `KEYSTORM_DEBUG_AUTOTAKE_PAUSES="60:8,120:8"` pauses after 60 s of recording for 8 s, and so on. The
+            // record time counts only time spent recording, so a pause never eats into it.
+            let pauses = (environment["KEYSTORM_DEBUG_AUTOTAKE_PAUSES"] ?? "").split(separator: ",").compactMap { part -> (Double, Double)? in
+                let pair = part.split(separator: ":").compactMap { Double($0) }
+                return pair.count == 2 ? (pair[0], pair[1]) : nil
+            }.sorted { $0.0 < $1.0 }
+            var recorded = 0.0
+            var nextPause = 0
+            var pauseLog: [String] = []
+            while recorded < recordSeconds {
+                try? await Task.sleep(for: .milliseconds(100))
+                if dictation.state == .recording { recorded += 0.1 }
+                if nextPause < pauses.count, recorded >= pauses[nextPause].0, dictation.state == .recording {
+                    let (_, length) = pauses[nextPause]
+                    nextPause += 1
+                    dictation.pauseResume()
+                    guard await wait(for: [.paused], seconds: 30) else { pauseLog.append("pause-failed:\(dictation.state.rawValue)"); continue }
+                    try? await Task.sleep(for: .seconds(length))
+                    dictation.pauseResume()
+                    if await wait(for: [.recording], seconds: 30) { pauseLog.append("pause-ok@\(Int(recorded))s/\(Int(length))s") }
+                    else { pauseLog.append("resume-failed:\(dictation.state.rawValue)") }
+                }
+            }
+            let finishStarted = ContinuousClock.now
+            dictation.finish()
+            let finished = await wait(for: [.ready, .failed], seconds: 180)
+            let components = finishStarted.duration(to: .now).components
+            configuration.log("autotake-result", fields: [
+                "finished": finished, "state": dictation.state.rawValue, "text": dictation.resultText,
+                "message": dictation.message, "destination": dictation.destinationLabel,
+                "mode": dictation.captureMode.rawValue, "pauses": pauseLog,
+                "rawText": dictation.handle.flatMap { self?.workspace?.dictationMetadata($0)?.textRevision?.rawText } ?? "",
+                "finishSeconds": Double(components.seconds) + Double(components.attoseconds) / 1e18])
+            try? await Task.sleep(for: .seconds(4))
+            dictation.preferences.mode = storedMode
+            dictation.preferences.copyWhenNotInserted = storedCopy
+            if quits { exit(0) }
+        }
+    }
+    #endif
+
+    /// File > Transcribe Audio or Video File…: asks for a file, then runs it through the dictation engine.
+    func chooseAndTranscribeFile() {
+        guard let dictation, !dictation.reservesCapture, !dictation.isTransitioning else { return }
+        let panel = NSOpenPanel()
+        panel.title = String(localized: "Transcribe an audio or video file")
+        panel.allowedContentTypes = [.audio, .movie, .audiovisualContent]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        showWorkspace?()
+        dictation.transcribeFile(url)
     }
 
     func perform(_ action: ShortcutAction) {
@@ -127,6 +251,46 @@ final class AppInteractionController {
         }
     }
 
+    /// Starting, recording or paused: a shortcut press finishes the take, and Escape cancels it.
+    private var dictationAcceptsFinish: Bool {
+        guard let state = dictation?.state else { return false }
+        return state == .starting || state == .recording || state == .paused
+    }
+
+    /// Start and finish from the dictation shortcut's tap and hold gesture. Both only act in the states they apply
+    /// to, so a release after a refused or finished take never starts another.
+    private func handleDictationCommand(_ command: DictationGestureCommand) {
+        guard let dictation else { return }
+        workspace?.recordPerformance(kind: "hotkey-main-queue",
+            milliseconds: Double(shortcuts.lastDispatchNanoseconds) / 1_000_000)
+        switch command {
+        case .start:
+            switch dictation.state {
+            case .idle, .ready, .failed: perform(.toggleDictation)
+            case .starting, .recording, .paused, .processing: break
+            }
+        case .finish:
+            switch dictation.state {
+            // Finish while the microphone is still opening is remembered and runs once recording begins.
+            case .starting: dictation.toggle()
+            case .recording, .paused: dictation.finish()
+            case .idle, .ready, .failed, .processing: break
+            }
+        }
+    }
+
+    /// Escape ends a dictation that is starting, recording or paused, and is never watched otherwise.
+    private func cancelDictationFromEscape() {
+        guard let dictation, dictationAcceptsFinish, dictation.canCancel else { return }
+        shortcuts.cancelDictationGesture()
+        dictation.cancel()
+    }
+
+    /// Follows the dictation state: Escape is watched only while there is a take to cancel.
+    func syncEscapeWatcher() {
+        escapeWatcher?.setActive(dictationAcceptsFinish)
+    }
+
     private func handleHold(_ pressed: Bool) {
         // Always forward releases: a pending legacy-owned startup may still need draining.
         guard !pressed || dictation?.reservesCapture != true else { return }
@@ -169,6 +333,7 @@ final class AppInteractionController {
         }
         // Reconcile and presentation writes stay outside observation tracking.
         dictation?.reconcileCaptureStatus(nextCaptureStatus)
+        syncEscapeWatcher()
         if let dictation {
             // A dismissed HUD stays hidden until the next Start, whatever changes after it.
             showDictation = dictation.wantsRecordingHUD && !dictation.recordingHUDDismissed && (dictation.hasActiveRecording ||
@@ -235,6 +400,7 @@ final class AppInteractionController {
         hold?.beginShutdown()
         dictation?.cancelForShutdown()
         shortcuts.stop()
+        escapeWatcher?.setActive(false)
         recordingHUDObservation = nil
         recordingHUD?.hide()
         dictationHUD?.hide()

@@ -31,9 +31,9 @@ struct DictationAppPresetsSection: View {
                 preferences.setPreset(.clean, bundleIdentifier: choice.bundleIdentifier, name: choice.name)
             }
             .accessibilityIdentifier("dictation.addAppPreset")
+        } header: { Text("App presets") } footer: {
             Text("When dictation starts in one of these apps, that recording uses the chosen mode. Your Next recording choice doesn't change. Translation is never a preset: it's always a preview you start after recording and apply yourself.")
-                .font(.caption).foregroundStyle(.secondary)
-        } header: { Text("App presets") }
+        }
     }
 
     private func modeBinding(for preset: DictationAppPreset) -> Binding<DictationQuickMode> {

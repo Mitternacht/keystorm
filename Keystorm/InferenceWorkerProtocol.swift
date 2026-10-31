@@ -17,6 +17,8 @@ struct InferenceWorkerRequest: Codable, Sendable {
     var audioDirectory: URL?
     var previewPCM: Data?
     var segments: [AudioSegment] = []
+    /// For a speech window: the segment whose words the caller keeps. Only its neighbours may be trimmed to fit.
+    var coreSegmentID: UUID?
     var transcripts: [TranscriptRevision] = []
     var contexts: [ContextSnapshot] = []
     var configuration: ProcessingConfiguration?

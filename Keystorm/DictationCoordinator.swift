@@ -19,7 +19,11 @@ enum DictationProcessingPhase: Sendable {
 
 enum DictationCaptureStatus: Equatable, Sendable {
     case recording, paused
+    /// Audio may be missing, so automatic insertion is off.
     case interrupted(String)
+    /// The microphone stopped without losing audio (route change, sleep, stall). The saved audio is intact and the
+    /// destination is still held, so Resume re-opens the input and Finish inserts what was captured.
+    case suspended(String)
 }
 
 @MainActor
@@ -38,6 +42,10 @@ protocol DictationRecordingBackend: AnyObject {
     func dictationResume(_ handle: DictationRecordingHandle) async throws
     func dictationComplete(_ handle: DictationRecordingHandle) async throws -> DictationTextRevision
     func dictationMetadata(_ handle: DictationRecordingHandle) -> DictationRecordingMetadata?
+    /// A caution for the result of the last Finish (a passage that may be missing words), or nil.
+    func dictationCompletionNotice(_ handle: DictationRecordingHandle) -> String?
+    /// Transcribes an audio or video file into a saved Long-recording dictation and returns its handle.
+    func dictationTranscribeFile(_ url: URL) async throws -> DictationRecordingHandle
     func dictationCaptureStatus(_ handle: DictationRecordingHandle) -> DictationCaptureStatus?
     func dictationCancel(_ handle: DictationRecordingHandle) async throws
     func dictationTransform(_ handle: DictationRecordingHandle, source: DictationTextRevision,
@@ -59,6 +67,10 @@ protocol DictationRecordingBackend: AnyObject {
 }
 
 extension DictationRecordingBackend {
+    func dictationCompletionNotice(_ handle: DictationRecordingHandle) -> String? { nil }
+    func dictationTranscribeFile(_ url: URL) async throws -> DictationRecordingHandle {
+        throw KeystormError.message("This build cannot transcribe files.")
+    }
     var dictationExternalCorrectionConsentID: UUID? { nil }
     func dictationObserveExternalCorrectionConsentChanges(_ onChange: @escaping @MainActor () -> Void) -> (any ExternalCorrectionCancellation)? { nil }
     func dictationObservedExternalCorrection(_ handle: DictationRecordingHandle, source: DictationTextRevision,
@@ -163,6 +175,12 @@ final class DictationCoordinator {
     private var delivering = false
     private var committingOutput = false
     @ObservationIgnored private var captureInterruption: String?
+    /// Set while the microphone is stopped without lost audio (route change, sleep, stall). Unlike an interruption it
+    /// keeps the destination, so Finish can still insert.
+    @ObservationIgnored private var captureSuspension: String?
+    /// Why Clean or Email failed on the latest Finish, when the raw transcript went out in its place. The HUD and
+    /// result view can show it; it clears when the next dictation starts.
+    private(set) var cleanupFailureReason: String?
     /// A Start/Finish press that arrived while Start was still opening the microphone; it finishes once recording begins.
     @ObservationIgnored private var finishRequestedWhileStarting = false
     /// How long a delivered result stays in the HUD before it hides; replaceable so tests need not wait.
@@ -184,6 +202,22 @@ final class DictationCoordinator {
     var hasActiveRecording: Bool { cancelling || [.starting, .recording, .paused, .processing].contains(state) }
     var canCancel: Bool { hasActiveRecording && !cancelling && !delivering }
     var isTransitioning: Bool { transition || cancelling || isTransforming || state == .starting || state == .processing }
+    /// Whether the last confirmed insertion is on offer for undo, and in which app. The menu item, shortcut and HUD
+    /// button observe this.
+    var insertionUndo: DictationUndoState { deliveryService.undoState }
+
+    /// Undoes the last confirmed insertion when its destination is provably unchanged since; otherwise changes
+    /// nothing and says why in `message`. Refused while a recording is in progress.
+    @discardableResult
+    func undoLastInsertion() async -> DictationUndoReceipt {
+        guard !hasActiveRecording, !isTransitioning else {
+            return DictationUndoReceipt(outcome: .refused,
+                message: "Finish or cancel the current recording before undoing the last dictation.", destination: nil)
+        }
+        let receipt = await deliveryService.undoLastInsertion(exclusions: preferences.userExclusions)
+        message = receipt.message
+        return receipt
+    }
 
     init(backend: any DictationRecordingBackend, delivery: DictationDeliveryService? = nil,
          preferences: DictationPreferences? = nil) {
@@ -218,7 +252,7 @@ final class DictationCoordinator {
             case .recording:
                 announcement = String(localized: "Recording", comment: "VoiceOver announcement when dictation records or resumes")
             case .paused:
-                announcement = captureInterruption == nil ?
+                announcement = captureInterruption == nil && captureSuspension == nil ?
                     String(localized: "Paused", comment: "VoiceOver announcement when dictation recording pauses") :
                     String(localized: "Recording interrupted and paused",
                            comment: "VoiceOver announcement when the microphone stops unexpectedly and the recording pauses")
@@ -243,6 +277,9 @@ final class DictationCoordinator {
         }
         announceStatus(announcement)
     }
+
+    /// Appended to the delivery outcome when Clean or Email failed and the raw transcript went out instead.
+    private static let cleanupFailedNote = " Cleanup failed, so the raw transcript was used."
 
     /// Settles a failure with its complete message already in place, so the transition is spoken once
     /// with the reason and the status line does not repeat it after the state changed.
@@ -304,6 +341,43 @@ final class DictationCoordinator {
     }
 
     func startLongRecording() { start(longRecording: true) }
+
+    /// Transcribes an audio or video file as a Long recording. The file is read, saved and finished like a
+    /// recording; when done, the result opens like any saved dictation. Cancel stops it.
+    func transcribeFile(_ url: URL) {
+        guard !reservesCapture, !isTransitioning else { return }
+        stopExternalCorrectionObservation()
+        clearCapturedContext()
+        releaseTarget()
+        transformPreview = nil; longTransformPreview = nil; previewSource = nil
+        outputMode = .verbatim; outputVersions = []; activeOutputID = nil
+        recordingPurpose = .longRecording
+        captureMode = .verbatim
+        handle = nil
+        revision = nil
+        resultText = ""
+        destinationLabel = "Editor after transcription"
+        wantsRecordingHUD = false
+        processingPhase = .transcribing
+        message = "Reading and transcribing “\(url.lastPathComponent)” on this Mac…"
+        state = .processing
+        operation = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let finished = try await self.backend.dictationTranscribeFile(url)
+                guard !Task.isCancelled, !self.cancelling else { return }
+                // `restore` refuses while a transcription is processing; this one has just ended.
+                self.state = .idle
+                self.restore(finished)
+                if let notice = self.backend.dictationCompletionNotice(finished) { self.message += " " + notice }
+            } catch {
+                guard !self.cancelling else { return }
+                self.message = error.localizedDescription
+                self.recordingPurpose = .quick
+                self.settleFailure(.failed)
+            }
+        }
+    }
 
     private func start(longRecording: Bool = false) {
         guard !reservesCapture, !isTransitioning else { return }
@@ -375,6 +449,8 @@ final class DictationCoordinator {
         transformPreview=nil; longTransformPreview=nil; previewSource=nil
         outputMode = .verbatim; outputVersions = []; activeOutputID = nil
         captureInterruption = nil
+        captureSuspension = nil
+        cleanupFailureReason = nil
         finishRequestedWhileStarting = false
         deliveredOnFinish = false
         resultText = ""
@@ -417,7 +493,7 @@ final class DictationCoordinator {
                 if resuming { try await self.backend.dictationResume(handle) }
                 else { try await self.backend.dictationPause(handle) }
                 guard !Task.isCancelled, !self.cancelling else { return }
-                if resuming { self.captureInterruption = nil }
+                if resuming { self.captureInterruption = nil; self.captureSuspension = nil }
                 self.state = resuming ? .recording : .paused
                 self.message = resuming ? "Recording locally." : "Paused. Resume continues the same recording."
             } catch { self.message = error.localizedDescription }
@@ -439,9 +515,11 @@ final class DictationCoordinator {
             contextStatus = destinationBlocked ? "Context unavailable" : "Context expired"
         }
         deliveredOnFinish = false
+        cleanupFailureReason = nil
         processingPhase = .transcribing
         state = .processing
         message = "Finishing the saved audio on this Mac…"
+        let interruptedBeforeFinish = captureInterruption != nil
         operation = Task { [weak self] in
             guard let self else { return }
             var deliveryAttempted = false
@@ -454,60 +532,29 @@ final class DictationCoordinator {
                     self.backend.dictationSetForegroundProcessing(handle, active: false)
                 }
                 let source = try await self.backend.dictationComplete(handle)
-                if self.captureInterruption == nil {
+                let completionNotice = self.backend.dictationCompletionNotice(handle)
+                // An interruption before Finish only took the destination away; the saved audio was complete, so
+                // its text still shows. One that arrives during Finish discards the result as before.
+                if self.captureInterruption == nil || interruptedBeforeFinish {
                     self.revision = source
                     self.resultText = source.text
                 }
                 try Task.checkCancellation()
                 var output = source
                 if requestedMode.transformsOnFinish {
-                    // Clean and Email share one durable path: raw text is already saved; the
-                    // transform must match every provenance field and pass its strict lexical
-                    // validator before Original/output versions commit and delivery may start.
-                    let finishMode = requestedMode.outputMode
-                    try self.requireCurrentOutput(source, handle: handle)
-                    self.processingPhase = .cleaning
-                    self.message = finishMode == .email ?
-                        "Formatting the saved transcript as an email on this Mac…" :
-                        "Cleaning the saved transcript on this Mac…"
-                    let cleaned = try await self.backend.dictationTransform(handle, source: source, mode: finishMode, context: context)
-                    try Task.checkCancellation()
-                    guard finishMode.preservesLexicalSequence,
-                          cleaned.mode == finishMode, cleaned.sourceRevisionID == source.id,
-                          cleaned.sourceSHA256 == DictationTransformPolicy.sourceDigest(source.text),
-                          cleaned.promptTemplateVersion == DictationTransformPolicy.templateVersion,
-                          cleaned.promptTemplateSHA256 == DictationTransformPolicy.promptTemplateSHA256(for: finishMode, context: context),
-                          cleaned.contextSHA256 == context?.digest,
-                          cleaned.generatedTokens > 0,
-                          cleaned.generatedTokens < DictationTransformPolicy.maxGeneratedTokens else {
-                        throw DictationTransformError.mismatchedResult
+                    do {
+                        output = try await self.transformOnFinish(source, mode: requestedMode, handle: handle, context: context)
+                    } catch {
+                        // A failed Clean must not cost the user their words. The raw transcript is already saved,
+                        // so it goes out in Clean's place and the result says so. Cancellation, an interruption, or
+                        // a saved source that changed underneath still end Finish as before.
+                        guard !(error is CancellationError), !Task.isCancelled, !self.cancelling,
+                              self.captureInterruption == nil || interruptedBeforeFinish,
+                              (try? self.requireCurrentOutput(source, handle: handle)) != nil else { throw error }
+                        self.committingOutput = false
+                        self.cleanupFailureReason = error.localizedDescription
+                        self.processingPhase = .inserting
                     }
-                    try DictationTransformPolicy.validateText(cleaned.text, source: source.text, mode: finishMode)
-                    try self.requireCurrentOutput(source, handle: handle)
-                    self.committingOutput = true
-                    let metadata = try await self.backend.dictationApplyTransform(handle, source: source, result: cleaned, context: context)
-                    self.committingOutput = false
-                    try Task.checkCancellation()
-                    try metadata.validateOutputHistory()
-                    guard metadata.id == handle.takeID,
-                          let saved = metadata.textRevision, saved.id == cleaned.jobID,
-                          metadata.activeOutputID == saved.id, metadata.outputMode == finishMode,
-                          saved.text.utf8.elementsEqual(cleaned.text.utf8),
-                          saved.rawText.utf8.elementsEqual(source.rawText.utf8),
-                          saved.sourceTranscriptIDs == source.sourceTranscriptIDs,
-                          let entry = metadata.outputHistory?.first(where: { $0.id == saved.id }),
-                          entry.sourceRevisionID == source.id, entry.sourceSHA256 == cleaned.sourceSHA256,
-                          entry.configurationID == cleaned.configurationID,
-                          entry.promptTemplateVersion == cleaned.promptTemplateVersion,
-                          entry.promptTemplateSHA256 == cleaned.promptTemplateSHA256,
-                          entry.contextSHA256 == cleaned.contextSHA256 else {
-                        throw DictationTransformError.mismatchedResult
-                    }
-                    try self.requireCurrentOutput(saved, handle: handle)
-                    output = saved
-                    self.loadOutputMetadata(metadata)
-                    self.revision = saved
-                    self.resultText = saved.text
                 }
                 if let target = self.target {
                     let requestID = UUID()
@@ -538,7 +585,7 @@ final class DictationCoordinator {
                     }
                     deliveryOutcome = receipt.outcome
                     self.deliveredOnFinish = receipt.outcome == .confirmed || receipt.outcome == .pasted
-                    self.message = receipt.message
+                    self.message = receipt.message + (self.cleanupFailureReason == nil ? "" : Self.cleanupFailedNote)
                     let attempted = DictationDelivery(requestID: requestID, textRevisionID: output.id,
                         targetLabel: receipt.destination.appName, state: status, detail: receipt.message)
                     // The write was already attempted, so its receipt must become durable even if this operation is
@@ -550,6 +597,8 @@ final class DictationCoordinator {
                     }.value
                     try Task.checkCancellation()
                     if receipt.outcome == .confirmed { observationContext = (target, output, requestID) }
+                } else if self.cleanupFailureReason != nil {
+                    self.message = "Cleanup failed, so the raw transcript was used. It is saved locally; review or copy when ready."
                 } else {
                     self.message = requestedMode.transformsOnFinish ?
                         (requestedMode == .email ? "Email text" : "Clean text") +
@@ -561,8 +610,11 @@ final class DictationCoordinator {
                     self.scheduleRecordingHUDAutoHide()
                 } else {
                     self.copyIfNotInserted(after: deliveryOutcome,
-                                           confirmation: "Copied to the clipboard. Paste it where you want it.")
+                        confirmation: (self.cleanupFailureReason == nil ? "" : "Cleanup failed, so the raw transcript was used. ") +
+                            "Copied to the clipboard. Paste it where you want it.")
                 }
+                // The text is complete as far as the speech model went; say where it may not be.
+                if let completionNotice, !self.message.contains(completionNotice) { self.message += " " + completionNotice }
             } catch {
                 // Only a destination never handed to delivery is still held here.
                 self.releaseTarget()
@@ -570,7 +622,24 @@ final class DictationCoordinator {
                 guard !self.cancelling else { return }
                 if let interruption = self.captureInterruption {
                     self.state = .paused
-                    self.message = interruption
+                    // Before Finish the interruption alone explained the pause; now Finish itself also failed.
+                    self.message = interruptedBeforeFinish && !(error is CancellationError) ?
+                        interruption + " " + error.localizedDescription : interruption
+                    return
+                }
+                if error is DictationNoSpeechError, self.revision == nil {
+                    // Nothing was said: a tap on the hotkey, a silent pause. That is an empty result, not a failure,
+                    // so the HUD closes without a red state. The recording stays in History.
+                    try? await self.backend.dictationSave(handle, state: .cancelled, revision: nil, delivery: nil,
+                        failure: error.localizedDescription)
+                    guard !Task.isCancelled else { return }
+                    self.wantsRecordingHUD = false
+                    self.message = "No speech detected."
+                    self.state = .idle
+                    if self.announcesStateChanges {
+                        self.spokenMessageRevision = self.messageRevision
+                        self.announceStatus(self.message)
+                    }
                     return
                 }
                 if requestedMode.transformsOnFinish, let metadata = self.backend.dictationMetadata(handle),
@@ -601,6 +670,58 @@ final class DictationCoordinator {
                 self.observeExternalCorrections(to: destination, source: source, handle: handle, deliveryID: deliveryID)
             }
         }
+    }
+
+    /// Clean and Email share one durable path: raw text is already saved; the transform must match every
+    /// provenance field and pass its strict lexical validator before Original/output versions commit and
+    /// delivery may start. Returns the committed output; any throw leaves the saved raw text as the current output.
+    private func transformOnFinish(_ source: DictationTextRevision, mode requestedMode: DictationQuickMode,
+                                   handle: DictationRecordingHandle,
+                                   context: DictationContextSnapshot?) async throws -> DictationTextRevision {
+        let finishMode = requestedMode.outputMode
+        try requireCurrentOutput(source, handle: handle)
+        processingPhase = .cleaning
+        message = finishMode == .email ?
+            "Formatting the saved transcript as an email on this Mac…" :
+            "Cleaning the saved transcript on this Mac…"
+        let cleaned = try await backend.dictationTransform(handle, source: source, mode: finishMode, context: context)
+        try Task.checkCancellation()
+        guard finishMode.preservesLexicalSequence,
+              cleaned.mode == finishMode, cleaned.sourceRevisionID == source.id,
+              cleaned.sourceSHA256 == DictationTransformPolicy.sourceDigest(source.text),
+              cleaned.promptTemplateVersion == DictationTransformPolicy.templateVersion,
+              cleaned.promptTemplateSHA256 == DictationTransformPolicy.promptTemplateSHA256(for: finishMode, context: context),
+              cleaned.contextSHA256 == context?.digest,
+              cleaned.generatedTokens > 0,
+              cleaned.generatedTokens < DictationTransformPolicy.maxGeneratedTokens else {
+            throw DictationTransformError.mismatchedResult
+        }
+        try DictationTransformPolicy.validateText(cleaned.text, source: source.text, mode: finishMode)
+        try requireCurrentOutput(source, handle: handle)
+        committingOutput = true
+        let metadata = try await backend.dictationApplyTransform(handle, source: source, result: cleaned, context: context)
+        committingOutput = false
+        try Task.checkCancellation()
+        try metadata.validateOutputHistory()
+        guard metadata.id == handle.takeID,
+              let saved = metadata.textRevision, saved.id == cleaned.jobID,
+              metadata.activeOutputID == saved.id, metadata.outputMode == finishMode,
+              saved.text.utf8.elementsEqual(cleaned.text.utf8),
+              saved.rawText.utf8.elementsEqual(source.rawText.utf8),
+              saved.sourceTranscriptIDs == source.sourceTranscriptIDs,
+              let entry = metadata.outputHistory?.first(where: { $0.id == saved.id }),
+              entry.sourceRevisionID == source.id, entry.sourceSHA256 == cleaned.sourceSHA256,
+              entry.configurationID == cleaned.configurationID,
+              entry.promptTemplateVersion == cleaned.promptTemplateVersion,
+              entry.promptTemplateSHA256 == cleaned.promptTemplateSHA256,
+              entry.contextSHA256 == cleaned.contextSHA256 else {
+            throw DictationTransformError.mismatchedResult
+        }
+        try requireCurrentOutput(saved, handle: handle)
+        loadOutputMetadata(metadata)
+        revision = saved
+        resultText = saved.text
+        return saved
     }
 
     private func stopExternalCorrectionObservation() {
@@ -943,7 +1064,8 @@ final class DictationCoordinator {
     /// After a confirmed insertion or a sent paste, the HUD shows the outcome briefly and then hides for this take.
     private func scheduleRecordingHUDAutoHide() {
         recordingHUDAutoHide?.cancel()
-        let delay = recordingHUDAutoHideDelay
+        // A cleanup failure stays up longer: it is the only place the user learns Clean did not run.
+        let delay = cleanupFailureReason == nil ? recordingHUDAutoHideDelay : recordingHUDAutoHideDelay * 3
         let handle = handle
         recordingHUDAutoHide = Task { [weak self] in
             try? await Task.sleep(for: delay)
@@ -1011,6 +1133,13 @@ final class DictationCoordinator {
                 state = .paused
                 message = "Recording stopped. Saved audio is paused; resume explicitly."
             }
+        case .suspended(let reason):
+            // Only a live recording moves. A paused or finishing one already owns its message and destination.
+            guard state == .recording else { return }
+            captureSuspension = reason
+            // The destination stays held: delivery re-checks the field itself, and Resume continues this take.
+            state = .paused
+            message = reason + " Finish inserts what you said so far."
         case .interrupted(let reason):
             clearCapturedContext()
             releaseTarget()

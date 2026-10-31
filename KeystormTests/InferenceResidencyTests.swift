@@ -120,6 +120,7 @@ struct InferenceResidencyTests {
 struct InferenceResidencyProcessTests {
     @Test("The private child exits at its idle lease and cancelled work cannot leak it",
           .enabled(if: ProcessInfo.processInfo.environment["KEYSTORM_RUN_RESIDENCY"] == "1"),
+          .exclusiveModelUse,
           .timeLimit(.minutes(2)))
     func idleTeardownAndCancellation() async throws {
         let directory = FileManager.default.temporaryDirectory
@@ -150,6 +151,7 @@ struct InferenceResidencyProcessTests {
 
     @Test("Installed speech and Qwen survive English/German jobs with bounded warm reuse",
           .enabled(if: ProcessInfo.processInfo.environment["KEYSTORM_RUN_RESIDENCY"] == "1"),
+          .exclusiveModelUse,
           .timeLimit(.minutes(10)))
     func installedModelsColdWarm() async throws {
         let models = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,

@@ -37,12 +37,18 @@ actor LocalInference {
     private var memoryCeiling = 6 * 1024 * 1024 * 1024
     private var verifiedFingerprints: [String: [String]] = [:]
     private(set) var integrityVerificationCount = 0
+    /// Verifications satisfied by the persisted record instead of reading and hashing the files.
+    private(set) var integrityCacheHitCount = 0
+    private let integrityStore: ModelIntegrityStore
     private var speechModelLoads: UInt64 = 0
     private var textModelLoads: UInt64 = 0
     private var speechModelLoadMicroseconds: UInt64 = 0
     private var textModelLoadMicroseconds: UInt64 = 0
 
-    init(modelDirectory: URL) { self.modelDirectory = modelDirectory }
+    init(modelDirectory: URL) {
+        self.modelDirectory = modelDirectory
+        integrityStore = ModelIntegrityStore(modelDirectory: modelDirectory)
+    }
 
     /// The worker subtracts the parent process footprint from the shared Mac budget.
     func setMemoryCeiling(_ bytes: Int) throws {
@@ -181,6 +187,11 @@ actor LocalInference {
         }
         if hadPrevious { try? FileManager.default.removeItem(at: backup) }
         verifiedFingerprints[model.id] = try artifactFingerprint(model, at: destination)
+        // Every artifact was hashed against the catalog above, and renaming the folder leaves
+        // each file's own identity unchanged, so the first launch after an install is warm too.
+        if let identities = try? artifactIdentities(model, at: destination) {
+            integrityStore.remember(identities, expectedSHA256: model.artifacts.map(\.sha256))
+        }
         progress(1)
         return configuration
     }
@@ -189,7 +200,23 @@ actor LocalInference {
         try await transcribeWindow(segments: segments, directory: audioDirectory, model: model).transcript
     }
 
-    func transcribeWindow(segments: [AudioSegment], directory audioDirectory: URL, model: ModelDescriptor) async throws -> SpeechWindowResult {
+    /// How far a window may run over the 15 s cap before a whole neighbouring segment is dropped. The overshoot is
+    /// trimmed from the context segments' outer edges instead. Capture rotates segments after the buffer that reaches
+    /// 5 s, so real segments run a little long, and three of them must not lose their context for that.
+    nonisolated static let maximumTrimmedOvershoot = 1.0
+
+    /// How many samples come off the left and right context edges to remove `excess`, split evenly and never more
+    /// than a side has. The two add up to `excess` when the contexts can absorb it, and fall short when they cannot.
+    nonisolated static func contextTrim(excess: Int, leftContext: Int, rightContext: Int) -> (left: Int, right: Int) {
+        guard excess > 0 else { return (0, 0) }
+        var left = min(leftContext, (excess + 1) / 2)
+        let right = min(rightContext, excess - left)
+        left = min(leftContext, excess - right)
+        return (left, right)
+    }
+
+    func transcribeWindow(segments: [AudioSegment], directory audioDirectory: URL, model: ModelDescriptor,
+                          coreSegmentID: UUID? = nil) async throws -> SpeechWindowResult {
         guard !operationInProgress else { throw failure("Another inference operation is still finishing.") }
         operationInProgress = true
         defer { operationInProgress = false }
@@ -199,7 +226,7 @@ actor LocalInference {
         let configuration = try configuration(for: model)
         let ordered = segments.sorted { $0.startTime < $1.startTime }
         guard let first = ordered.first, let last = ordered.last,
-              ordered.reduce(0, { $0 + $1.duration }) <= Self.maximumWindowSeconds + 0.001 else {
+              ordered.reduce(0, { $0 + $1.duration }) <= Self.maximumWindowSeconds + Self.maximumTrimmedOvershoot + 0.001 else {
             throw failure("Transcription jobs must contain at most 15 seconds of persisted audio.")
         }
         for (left, right) in zip(ordered, ordered.dropFirst()) {
@@ -211,6 +238,7 @@ actor LocalInference {
         let converter = AudioConverter(sampleRate: 16_000)
         var samples: [Float] = []
         samples.reserveCapacity(240_000)
+        var segmentSampleCounts: [Int] = []
         for segment in ordered {
             try Task.checkCancellation()
             guard segment.fileName == URL(fileURLWithPath: segment.fileName).lastPathComponent else {
@@ -218,13 +246,29 @@ actor LocalInference {
             }
             let url = audioDirectory.appendingPathComponent(segment.fileName)
             guard try Self.sha256(url) == segment.sha256 else { throw failure("Audio checksum mismatch. Original audio was not modified.") }
+            let before = samples.count
             samples.append(contentsOf: try converter.resampleAudioFile(url))
+            segmentSampleCounts.append(samples.count - before)
         }
-        // Resampling can round a capped window a few samples past 15 s. Trim that overshoot from the
-        // tail, which is right context whenever the window is long enough to need it, so the model
-        // input and gap recovery stay within 240_000 samples. Larger excess is not rounding.
-        guard samples.count <= 240_000 + 1_600 else { throw failure("The audio window exceeds the bounded 15-second job limit.") }
-        if samples.count > 240_000 { samples.removeLast(samples.count - 240_000) }
+        // A window over the 240_000-sample cap (resampling rounding, or segments that ran slightly past 5 s) sheds
+        // the excess from the outer edges of its context segments, never from the segment whose words are kept.
+        // Without a known core, only a few samples of rounding come off the tail, as before.
+        var leadingTrim = 0
+        if samples.count > 240_000 {
+            let excess = samples.count - 240_000
+            var left = 0, right = 0
+            if let coreSegmentID, ordered.count > 1 {
+                let leftContext = ordered.first?.id == coreSegmentID ? 0 : (segmentSampleCounts.first ?? 0)
+                let rightContext = ordered.last?.id == coreSegmentID ? 0 : (segmentSampleCounts.last ?? 0)
+                (left, right) = Self.contextTrim(excess: excess, leftContext: leftContext, rightContext: rightContext)
+            } else {
+                right = min(excess, 1_600)
+            }
+            guard left + right == excess else { throw failure("The audio window exceeds the bounded 15-second job limit.") }
+            if right > 0 { samples.removeLast(right) }
+            if left > 0 { samples.removeFirst(left) }
+            leadingTrim = left
+        }
         guard samples.allSatisfy(\.isFinite) else { throw failure("The saved audio contains invalid samples.") }
         var state = try TdtDecoderState()
         let result = try await speech.transcribe(samples, decoderState: &state)
@@ -275,9 +319,9 @@ actor LocalInference {
                                   segmentIDs: ordered.map(\.id), startTime: first.startTime,
                                   endTime: last.endTime, timingPrecision: .window,
                                   configurationID: configuration.id, isComplete: complete)
+        let origin = first.startTime + Double(leadingTrim) / 16_000
         let words = relativeWords.map {
-            TimedSpeechWord(word: $0.word, startTime: first.startTime + $0.startTime,
-                            endTime: first.startTime + $0.endTime)
+            TimedSpeechWord(word: $0.word, startTime: origin + $0.startTime, endTime: origin + $0.endTime)
         }
         return SpeechWindowResult(transcript: transcript, words: words)
     }
@@ -788,7 +832,10 @@ actor LocalInference {
             }
         }
         let container = try await loadedText()
-        _ = try await grammarResources(in: container)
+        let grammar = try await grammarResources(in: container)
+        // Compile the Clean/Email schema now, off the Finish path. A failure here is not the
+        // warm-up's to report: the transform compiles it again and surfaces any real error.
+        try? grammar.prime(.dictationTransform)
         try Task.checkCancellation()
         try checkMemoryHeadroom()
     }
@@ -869,13 +916,28 @@ actor LocalInference {
         }
     }
 
-    /// Full hashes are checked once per process/install, then when file identity or
+    /// Full hashes are checked once per install, then only when file identity or
     /// nanosecond modification/change metadata changes. Window dispatch does only stat calls.
+    /// A new process first consults the persisted record of earlier verifications, which holds
+    /// only while every file still has the exact identity it was hashed with (see
+    /// `ModelIntegrityStore`). `force` always hashes, because it is the explicit repair check.
+    /// Returns true when the artifacts were (re)verified, so callers reload resident models.
     @discardableResult
     func verifyArtifacts(_ model: ModelDescriptor, at directory: URL, force: Bool = false) throws -> Bool {
         let fingerprint = try artifactFingerprint(model, at: directory)
         if !force, verifiedFingerprints[model.id] == fingerprint { return false }
         verifiedFingerprints.removeValue(forKey: model.id)
+        let identities = try artifactIdentities(model, at: directory)
+        let expected = model.artifacts.map(\.sha256)
+        if !force, integrityStore.confirms(identities, expectedSHA256: expected) {
+            // The records matched the identities read above; confirm nothing moved since.
+            guard try artifactFingerprint(model, at: directory) == fingerprint else {
+                throw failure("Model artifacts changed during verification. Retry after installation finishes.")
+            }
+            verifiedFingerprints[model.id] = fingerprint
+            integrityCacheHitCount += 1
+            return true
+        }
         for artifact in model.artifacts {
             try Task.checkCancellation()
             guard try Self.sha256(directory.appendingPathComponent(artifact.path)) == artifact.sha256 else {
@@ -887,7 +949,20 @@ actor LocalInference {
         }
         verifiedFingerprints[model.id] = fingerprint
         integrityVerificationCount += 1
+        integrityStore.remember(identities, expectedSHA256: expected)
         return true
+    }
+
+    /// The persisted-record key for each artifact, in catalog order. Throws like the fingerprint
+    /// for a missing, non-regular or wrongly sized file, so a size change never reaches the cache.
+    private func artifactIdentities(_ model: ModelDescriptor, at directory: URL) throws -> [ModelFileIdentity] {
+        try model.artifacts.map { artifact in
+            guard let identity = ModelFileIdentity.current(at: directory.appendingPathComponent(artifact.path)),
+                  identity.size == artifact.bytes else {
+                throw failure("An installed model file is missing or changed. Reinstall \(model.displayName).")
+            }
+            return identity
+        }
     }
 
     private func artifactFingerprint(_ model: ModelDescriptor, at directory: URL) throws -> [String] {
@@ -910,7 +985,8 @@ actor LocalInference {
                 "speechModelLoaded": speech == nil ? 0 : 1, "textModelLoaded": text == nil ? 0 : 1,
                 "speechModelLoads": speechModelLoads, "textModelLoads": textModelLoads,
                 "speechModelLoadMicroseconds": speechModelLoadMicroseconds,
-                "textModelLoadMicroseconds": textModelLoadMicroseconds]
+                "textModelLoadMicroseconds": textModelLoadMicroseconds,
+                "integrityCacheHits": UInt64(integrityCacheHitCount)]
         measurements.merge(grammarCache?.statistics() ?? [:]) { _, new in new }
         return measurements
     }

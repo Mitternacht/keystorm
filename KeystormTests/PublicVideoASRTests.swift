@@ -11,6 +11,7 @@ import os
 struct PublicVideoASRTests {
     @Test("Public human video audio completes through the production local dictation backend",
           .enabled(if: ProcessInfo.processInfo.environment["KEYSTORM_RUN_PUBLIC_VIDEO_ASR"] == "1"),
+          .exclusiveModelUse,
           .timeLimit(.minutes(15)))
     func publicVideoAudioCompletesThroughWorkspaceBackend() async throws {
         let manifestURL = URL(fileURLWithPath: ProcessInfo.processInfo.environment["KEYSTORM_PUBLIC_VIDEO_ASR_MANIFEST"]

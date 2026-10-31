@@ -11,6 +11,7 @@ import os
 struct LocalModelSmokeTests {
     @Test("Installed Ultra and Qwen run locally with bounded jobs",
           .enabled(if: ProcessInfo.processInfo.environment["KEYSTORM_RUN_MODEL_SMOKE"] == "1"),
+          .exclusiveModelUse,
           .timeLimit(.minutes(10)))
     func installedLocalRuntime() async throws {
         let models = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,

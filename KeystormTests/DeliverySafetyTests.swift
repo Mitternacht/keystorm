@@ -230,7 +230,8 @@ struct DeliverySafetyTests {
         } else {
             #expect(context?.availability == .nearbyText)
         }
-        #expect(adapter.writes == 0, "The transform fails, so nothing is delivered.")
+        // The transform fails, so the raw transcript is inserted, unless the destination was blocked.
+        #expect(adapter.writes == (blockedDuringRecording ? 0 : 1))
     }
 
     // MARK: (c) Moved-element races

@@ -16,55 +16,55 @@ struct DictationRecordingToolsView: View {
     @State private var chooseReplacement = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 24) {
+                if let row {
+                    DictationAudioSummary(duration: row.duration, createdAt: row.take.createdAt,
+                        activeRevision: row.take.audioRevisions?.first(where: { $0.id == row.take.activeAudioRevisionID })?.label)
+                    DictationAudioPlaybackControls(hasAudio: !row.segments.isEmpty && row.duration > 0,
+                        isWorking: isWorking,
+                        play: { run { try await model.dictationPlayRecording(handle) } },
+                        stop: { model.stopPlayback() })
+                    DictationAudioTrimControls(duration: row.duration, isWorking: isWorking) { start, end in
+                        run(changesAudio: true) {
+                            try await model.dictationTrimRecording(handle, start: start, end: end)
+                        }
+                    }
+                    DictationAudioVersionControls(activeRevisionID: row.take.activeAudioRevisionID,
+                        versions: row.take.audioRevisions ?? [], isWorking: isWorking,
+                        importReplacement: { chooseReplacement = true },
+                        restore: { revisionID in
+                            run(changesAudio: true) { try await model.dictationRestoreRecording(handle, revisionID: revisionID) }
+                        })
+                    Divider()
+                    DictationAudioExportControls(isWorking: isWorking, hasAudio: !row.segments.isEmpty,
+                        export: exportArchive,
+                        retranscribe: {
+                            model.stopPlayback()
+                            dismiss()
+                            onRetranscribe()
+                        })
+                } else if failureMessage == nil {
+                    ProgressView("Opening saved recording…")
+                }
+                if let failureMessage {
+                    Label(failureMessage, systemImage: "exclamationmark.circle")
+                        .font(.callout).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("dictation.audio.error")
+                }
+                if !status.isEmpty {
+                    Text(status).font(.callout).foregroundStyle(.secondary)
+                        .accessibilityIdentifier("dictation.audio.status")
+                }
+            }
+            .padding(24)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        // The header floats above the scrolling tools; content blurs beneath it instead of a hand-drawn divider.
+        .safeAreaBar(edge: .top, spacing: 0) {
             DictationRecordingToolsHeader(title: row?.take.displayName ?? String(localized: "Recording"),
                 isWorking: isWorking, close: { dismiss() })
-            Divider()
-            ScrollView {
-                VStack(alignment: .leading, spacing: 24) {
-                    if let row {
-                        DictationAudioSummary(duration: row.duration, createdAt: row.take.createdAt,
-                            activeRevision: row.take.audioRevisions?.first(where: { $0.id == row.take.activeAudioRevisionID })?.label)
-                        DictationAudioPlaybackControls(hasAudio: !row.segments.isEmpty && row.duration > 0,
-                            isWorking: isWorking,
-                            play: { run { try await model.dictationPlayRecording(handle) } },
-                            stop: { model.stopPlayback() })
-                        DictationAudioTrimControls(duration: row.duration, isWorking: isWorking) { start, end in
-                            run(changesAudio: true) {
-                                try await model.dictationTrimRecording(handle, start: start, end: end)
-                            }
-                        }
-                        DictationAudioVersionControls(activeRevisionID: row.take.activeAudioRevisionID,
-                            versions: row.take.audioRevisions ?? [], isWorking: isWorking,
-                            importReplacement: { chooseReplacement = true },
-                            restore: { revisionID in
-                                run(changesAudio: true) { try await model.dictationRestoreRecording(handle, revisionID: revisionID) }
-                            })
-                        Divider()
-                        DictationAudioExportControls(isWorking: isWorking, hasAudio: !row.segments.isEmpty,
-                            export: exportArchive,
-                            retranscribe: {
-                                model.stopPlayback()
-                                dismiss()
-                                onRetranscribe()
-                            })
-                    } else if failureMessage == nil {
-                        ProgressView("Opening saved recording…")
-                    }
-                    if let failureMessage {
-                        Label(failureMessage, systemImage: "exclamationmark.circle")
-                            .font(.callout).foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .accessibilityIdentifier("dictation.audio.error")
-                    }
-                    if !status.isEmpty {
-                        Text(status).font(.callout).foregroundStyle(.secondary)
-                            .accessibilityIdentifier("dictation.audio.status")
-                    }
-                }
-                .padding(24)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
         }
         .frame(minWidth: 620, idealWidth: 680, minHeight: 600, idealHeight: 700)
         .interactiveDismissDisabled(isWorking)
@@ -142,8 +142,13 @@ private struct DictationRecordingToolsHeader: View {
             }
             Spacer()
             if isWorking { ProgressView().controlSize(.small).accessibilityLabel("Updating saved audio") }
-            Button("Done", action: close).keyboardShortcut(.cancelAction).disabled(isWorking)
-        }.padding(24)
+            Button("Done", action: close)
+                .buttonStyle(.glassProminent)
+                .keyboardShortcut(.cancelAction)
+                .disabled(isWorking)
+        }
+        .padding(.horizontal, 24)
+        .padding(.vertical, 16)
     }
 }
 
@@ -155,7 +160,7 @@ private struct DictationAudioSummary: View {
         HStack(alignment: .top, spacing: 24) {
             LabeledContent("Duration", value: Duration.seconds(duration).formatted(.time(pattern: .hourMinuteSecond)))
             Spacer()
-            VStack(alignment: .trailing, spacing: 6) {
+            VStack(alignment: .trailing, spacing: 4) {
                 Text(activeRevision ?? String(localized: "Original audio")).font(.callout.weight(.medium))
                 Text(createdAt, format: .dateTime.month(.abbreviated).day().hour().minute())
                     .font(.caption).foregroundStyle(.secondary)

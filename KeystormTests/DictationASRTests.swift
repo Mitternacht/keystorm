@@ -11,6 +11,7 @@ import os
 struct DictationASRTests {
     @Test("Local dictation preserves English/German code switches and resumed intervals",
           .enabled(if: ProcessInfo.processInfo.environment["KEYSTORM_RUN_DICTATION_ASR"] == "1"),
+          .exclusiveModelUse,
           .timeLimit(.minutes(10)))
     func installedBilingualDictation() async throws {
         let models = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
@@ -88,6 +89,7 @@ struct DictationASRTests {
 
     @Test("Local ASR preserves German words inside a real human English utterance",
           .enabled(if: ProcessInfo.processInfo.environment["KEYSTORM_RUN_DICTATION_HUMAN_ASR"] == "1"),
+          .exclusiveModelUse,
           .timeLimit(.minutes(5)))
     func humanEnglishGermanCodeSwitch() async throws {
         let repository = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
