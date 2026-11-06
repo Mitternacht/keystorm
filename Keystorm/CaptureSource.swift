@@ -1,5 +1,7 @@
 import AppKit
+import AudioToolbox
 import AVFoundation
+import CoreAudio
 import Foundation
 
 /// Something the audio source reports on its own, outside any call from capture.
@@ -111,6 +113,28 @@ final class EngineCaptureSource: CaptureSource {
         engine.prepare()
         try engine.start()
         observe(engine: engine, onEvent: onEvent)
+    }
+
+    /// Reads the device bound to the actual running input AudioUnit, not the system default.
+    /// Used only by explicit physical recovery validation; it never changes routing.
+    func currentInputDeviceID() throws -> UInt32 {
+        guard let engine, engine.isRunning, let tapNode else {
+            throw KeystormError.message("The microphone input must be running to inspect its actual device.")
+        }
+        return try tapNode.withAudioUnit { unit in
+            guard let unit else {
+                throw KeystormError.message("The running microphone input has no AudioUnit.")
+            }
+            var device = AudioDeviceID(kAudioObjectUnknown)
+            var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+            let status = AudioUnitGetProperty(unit, kAudioOutputUnitProperty_CurrentDevice,
+                kAudioUnitScope_Global, 0, &device, &size)
+            guard status == noErr, size == MemoryLayout<AudioDeviceID>.size,
+                  device != kAudioObjectUnknown else {
+                throw KeystormError.message("The microphone AudioUnit device could not be read (status \(status)).")
+            }
+            return device
+        }
     }
 
     func stop() {

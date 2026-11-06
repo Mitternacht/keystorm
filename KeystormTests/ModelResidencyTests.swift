@@ -153,7 +153,7 @@ struct LivePreviewPacingTests {
     func slowDecodeBacksOff() {
         #expect(LivePreviewPacing.interval(sequence: 5, lastDecode: .milliseconds(400)) == .milliseconds(800))
         #expect(LivePreviewPacing.interval(sequence: 5, lastDecode: .milliseconds(900)) == .milliseconds(1_800))
-        #expect(LivePreviewPacing.interval(sequence: 5, lastDecode: .seconds(10)) == .seconds(2))
+        #expect(LivePreviewPacing.interval(sequence: 5, lastDecode: .seconds(10)) == .seconds(20))
         #expect(LivePreviewPacing.interval(sequence: 5, lastDecode: .seconds(-1)) == .milliseconds(500))
     }
 }

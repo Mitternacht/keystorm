@@ -2,13 +2,18 @@ import Foundation
 import MLXGuidedGeneration
 import MLXLMCommon
 
-/// Model-owned immutable tokenizer resources. Vocabulary discovery and tokenizer
-/// construction happen once per loaded model, and so does compiling each schema: the cache
-/// keeps one pristine compiled constraint per schema and hands every job its own fork
-/// (`GrammarConstraint.clone()` shares the immutable compiled grammar and copies only the
-/// matcher state). A job never advances the pristine copy, so every fork starts untouched.
-/// If a fork ever fails, the job falls back to compiling its own constraint, as before.
+/// Model-owned tokenizer and compiled grammar resources. A supported bridge forks a
+/// pristine template; the pinned bridge instead lends one matcher exclusively and rolls it
+/// back after completed generation. Failed or cancelled jobs discard their matcher.
+/// At most one reset matcher per schema remains cached, and every active job has its own state.
 final class LocalGrammarCache: @unchecked Sendable {
+    /// The pinned GuidedGenerationLoop omits the sampled token from the model cache
+    /// whenever a grammar fast-forward follows it. Keep normal grammar-masked sampling
+    /// until that upstream path preserves exact history. This retains every constraint
+    /// and model check; only the optional structural-token shortcut is disabled.
+    /// GuidedGenerationHistoryTests covers the production policy and the upstream defect.
+    static let fastForwardEnabled = false
+
     enum Schema: Hashable, Sendable {
         case extraction, edit, dictationTransform, correctionClassification
 
@@ -48,7 +53,7 @@ final class LocalGrammarCache: @unchecked Sendable {
         tokenizerMicroseconds = 0
     }
 
-    /// An untouched matcher for one job. Compiles the schema only the first time.
+    /// An untouched matcher for one job. Scoped users return it through `withConstraint`.
     func constraint(for schema: Schema) throws -> GrammarConstraint {
         lock.lock()
         defer { lock.unlock() }
@@ -74,6 +79,38 @@ final class LocalGrammarCache: @unchecked Sendable {
         return matcher
     }
 
+    /// Borrows one matcher for a synchronous generation. Only a normally completed operation
+    /// may return its exact number of accepted tokens (including fast-forward tokens).
+    /// An early emit stop, cancellation or failure must throw: its accepted-token count can
+    /// differ from the generation loop's returned count, so that matcher must be discarded.
+    /// The matcher must not escape this scope.
+    func withConstraint<Value>(
+        for schema: Schema,
+        _ operation: (GrammarConstraint) throws -> (value: Value, acceptedTokens: Int)
+    ) throws -> Value {
+        try Task.checkCancellation()
+        let matcher = try constraint(for: schema)
+        let initial = try matcher.computeMask()
+        let result = try operation(matcher)
+        try Task.checkCancellation()
+        guard let accepted = Int32(exactly: result.acceptedTokens), accepted >= 0 else { return result.value }
+        do {
+            // The pinned bridge has unlimited rollback history even though it cannot fork.
+            // Rewinding an exclusively borrowed matcher preserves its compiled grammar.
+            try matcher.rollback(accepted)
+            let reset = try matcher.computeMask()
+            guard reset.mask == initial.mask, reset.isTerminated == initial.isTerminated,
+                  reset.needsApply == initial.needsApply else { return result.value }
+            lock.lock()
+            if templates[schema] == nil { spares[schema] = matcher }
+            lock.unlock()
+        } catch {
+            // A failed cache reset never invalidates a completed result. Drop this matcher;
+            // the next request will compile a fresh one, as it did before reuse existed.
+        }
+        return result.value
+    }
+
     /// Compiles a schema ahead of its first job, for example while the text model warms up,
     /// so the first Clean does not pay for it. Hands out nothing; the next job takes the spare
     /// when forking is unavailable.
@@ -89,7 +126,7 @@ final class LocalGrammarCache: @unchecked Sendable {
 
     private func compileLocked(_ schema: Schema) throws -> GrammarConstraint {
         let compiled = try GrammarConstraint(tokenizer: tokenizer, jsonSchema: schema.json,
-            fastForward: hostTokenizer != nil, hostTokenizer: hostTokenizer)
+            fastForward: Self.fastForwardEnabled && hostTokenizer != nil, hostTokenizer: hostTokenizer)
         compilations += 1
         return compiled
     }

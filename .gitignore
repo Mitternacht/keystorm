@@ -19,6 +19,14 @@ LocalData/
 
 *.profdata
 
+# Raw benchmark evidence contains local paths, device/session details and captures.
+# Publish only the reviewed summary in Release/PERFORMANCE.md.
+/Release/Benchmarks/
+
+# Python verification caches
+__pycache__/
+*.py[cod]
+
 
 # Never publish signing material, secrets, recordings, traces or local databases
 *.p8

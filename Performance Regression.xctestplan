@@ -1,0 +1,34 @@
+{
+  "configurations": [
+    {
+      "id": "1D56C793-FD3B-435F-B038-E3ECB84B9BD3",
+      "name": "Performance regression",
+      "options": {}
+    }
+  ],
+  "defaultOptions": {
+    "environmentVariableEntries": [
+      {
+        "key": "KEYSTORM_RUN_RESIDENCY",
+        "value": "1",
+        "isEnabled": true
+      }
+    ],
+    "targetForVariableExpansion": {
+      "containerPath": "container:Keystorm.xcodeproj",
+      "identifier": "47223C533084400F00C520EE",
+      "name": "Keystorm"
+    },
+    "testInteropMode": "complete"
+  },
+  "testTargets": [
+    {
+      "target": {
+        "containerPath": "container:Keystorm.xcodeproj",
+        "identifier": "47223C603084401100C520EE",
+        "name": "KeystormTests"
+      }
+    }
+  ],
+  "version": 1
+}

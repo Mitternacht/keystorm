@@ -262,6 +262,7 @@ actor InferenceWorkerClient {
         ]
         measurements.merge(lastWorkerMemory.filter {
             $0.key.hasPrefix("grammar") || $0.key.hasPrefix("textModel") || $0.key.hasPrefix("speechModel") ||
+            $0.key.hasPrefix("transform") ||
             ["workerPeakFootprint", "workerRequestPeakFootprint", "workerMemoryCeiling", "workerFootprintSamples"].contains($0.key)
         }) { _, new in new }
         for (key, value) in lastFailureMemory { measurements["lastFailure." + key] = value }

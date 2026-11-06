@@ -10,6 +10,9 @@ The ping starts only the private worker, with an empty temporary model directory
 It also runs Release/audit_signatures.py on every nested code item, checks that bundled
 binaries load libraries only from the app or the system (no build-machine paths), and
 looks for repository documents and dotfiles in the bundle.
+Passing also requires --performance-baseline and --performance-candidate raw
+component reports: qualification is recomputed, the candidate must be at most
+7 days old, and its app/version/Mach-O UUID identity must match this artifact.
 --development-identity checks a Release-configuration build signed with the Apple
 Development identity: it expects that authority instead of Developer ID and treats a
 missing secure timestamp as a warning. Such a report is never a distributable result.
@@ -19,6 +22,7 @@ notarization/Gatekeeper, or installation on another Mac.
 import argparse
 import ctypes
 import datetime
+import hashlib
 import importlib.util
 import json
 import os
@@ -80,17 +84,176 @@ def resolve_app(path):
     return path
 
 
-def load_audit_module():
+def load_release_module(name):
     # Loaded by explicit path so `python3 -I` (no script directory on sys.path) still works,
     # and without writing __pycache__ into the repository.
     sys.dont_write_bytecode = True
-    path = Path(__file__).resolve().with_name("audit_signatures.py")
-    spec = importlib.util.spec_from_file_location("keystorm_audit_signatures", path)
+    path = Path(__file__).resolve().with_name(name + ".py")
+    spec = importlib.util.spec_from_file_location("keystorm_" + name, path)
     if spec is None or spec.loader is None:
         raise ImportError("Cannot load %s" % path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def load_audit_module():
+    return load_release_module("audit_signatures")
+
+
+def capture_artifact_identity(app, info, runner=None):
+    """Match the benchmark's canonical executable paths and all Mach-O UUID slices.
+
+    Exclude test bundles and debug symbols inserted by Xcode's test action; neither
+    is shipped app code. Signing can change without changing these UUIDs.
+    """
+    app = app.resolve(strict=True)
+    runner = runner or command
+    magic = {bytes.fromhex(value) for value in (
+        "feedface", "feedfacf", "cefaedfe", "cffaedfe", "cafebabe", "bebafeca", "cafebabf", "bfbafeca")}
+    binaries = {}
+    seen = set()
+
+    def walk_error(error):
+        raise error
+
+    for current, directories, files in os.walk(app, followlinks=False, onerror=walk_error):
+        directories[:] = sorted(name for name in directories
+                                if not name.endswith((".xctest", ".dSYM")) and name not in ("_CodeSignature", ".git")
+                                and not (Path(current) / name).is_symlink())
+        for name in sorted(files):
+            path = Path(current) / name
+            if path.is_symlink() or not path.is_file():
+                continue
+            canonical = path.resolve(strict=True)
+            if canonical in seen:
+                continue
+            seen.add(canonical)
+            with canonical.open("rb") as binary:
+                if binary.read(4) not in magic:
+                    continue
+            relative = canonical.relative_to(app).as_posix()
+            result = runner(["/usr/bin/xcrun", "dwarfdump", "--uuid", str(canonical)], timeout=60)
+            if result["code"] != 0 or result.get("oversized"):
+                raise ValueError("Cannot read Mach-O UUIDs for %s: %s" % (relative, text(result)[:512]))
+            slices = [{"uuid": match.group(1), "architecture": match.group(2)} for match in re.finditer(
+                r"^UUID:\s+([0-9A-Fa-f-]+)\s+\(([^)]+)\)", result["stdout"].decode("utf-8"), re.MULTILINE)]
+            architectures = runner(["/usr/bin/xcrun", "lipo", "-archs", str(canonical)], timeout=60)
+            if architectures["code"] != 0 or architectures.get("oversized"):
+                raise ValueError("Cannot enumerate Mach-O architectures for " + relative)
+            arch_names = architectures["stdout"].decode("utf-8").split()
+            uuid_arch_names = [item["architecture"] for item in slices]
+            if (not slices or not arch_names or len(arch_names) != len(set(arch_names))
+                    or len(uuid_arch_names) != len(set(uuid_arch_names))
+                    or set(arch_names) != set(uuid_arch_names)):
+                raise ValueError("Missing, duplicate, or incomplete Mach-O UUID architecture coverage for " + relative)
+            binaries[relative] = slices
+    identity = {"schemaVersion": 1, "bundleIdentifier": info.get("CFBundleIdentifier"),
+                "marketingVersion": info.get("CFBundleShortVersionString"), "buildNumber": info.get("CFBundleVersion"),
+                "mainExecutable": "Contents/MacOS/" + str(info.get("CFBundleExecutable", "")),
+                "machoUUIDs": binaries}
+    return load_release_module("compare_performance").artifact_identity(identity)
+
+
+def llvm_profile_sections(output, architecture, expected_uuid):
+    """Parse one otool -arch ... -h -l slice, rejecting empty/wrong/truncated output."""
+    lines = [line.split() for line in output.splitlines() if line.strip()]
+    header_fields = ["magic", "cputype", "cpusubtype", "caps", "filetype", "ncmds", "sizeofcmds", "flags"]
+    headers = [index for index, line in enumerate(lines) if line == header_fields]
+    cpus = {"arm64": (16777228, 0), "arm64e": (16777228, 2),
+            "x86_64": (16777223, 3), "x86_64h": (16777223, 8),
+            "i386": (7, 3), "armv7": (12, 9), "armv7s": (12, 11), "arm64_32": (33554444, 1)}
+    error = "Incomplete or mismatched Mach-O section inspection for " + architecture
+    try:
+        if len(headers) != 1 or architecture not in cpus:
+            raise ValueError(error)
+        header = lines[headers[0] + 1]
+        if (len(header) != 8 or header[0] not in ("0xfeedface", "0xfeedfacf")
+                or (int(header[1]), int(header[2]) & 0x00ffffff) != cpus[architecture]):
+            raise ValueError(error)
+        count, size = int(header[5]), int(header[6])
+        commands = [int(line[2]) for line in lines if line[:2] == ["Load", "command"] and len(line) == 3]
+        kinds = [line for line in lines if line[0] == "cmd" and len(line) == 2]
+        sizes = [int(line[1]) for line in lines if line[0] == "cmdsize" and len(line) == 2]
+        uuids = [line for line in lines if line[0] == "uuid"]
+        counts = [line for line in lines if line[0] == "nsects"]
+        section_counts = [int(line[1]) for line in counts if len(line) == 2]
+        sections = [line for line in lines if line[0] == "sectname"]
+        if (count <= 0 or count > len(lines) or commands != list(range(count)) or len(kinds) != count
+                or len(sizes) != count or any(value <= 0 for value in sizes) or sum(sizes) != size
+                or uuids != [["uuid", expected_uuid.upper()]] or not counts
+                or len(section_counts) != len(counts) or any(value < 0 for value in section_counts)
+                or not sections or len(sections) != sum(section_counts)
+                or any(len(line) != 2 for line in sections)
+                or lines.count(["Section"]) != len(sections)):
+            raise ValueError(error)
+        return sorted({line[1] for line in sections
+                       if line[1].startswith(("__llvm_prf_", "__llvm_cov"))})
+    except (IndexError, ValueError) as cause:
+        raise ValueError(error) from cause
+
+
+def capture_build_instrumentation(app, identity, runner=None):
+    """Independently inspect all identity slices; never infer 'off' from configuration."""
+    performance = load_release_module("compare_performance")
+    identity = performance.artifact_identity(identity)
+    app, runner = app.resolve(strict=True), runner or command
+    binaries = []
+    for path, slices in sorted(identity["machoUUIDs"].items()):
+        binary = (app / path).resolve(strict=True)
+        if not binary.is_relative_to(app):
+            raise ValueError("Mach-O path escaped app: " + path)
+        for item in slices:
+            result = runner(["/usr/bin/xcrun", "otool", "-arch", item["architecture"], "-h", "-l", str(binary)], timeout=60)
+            if result["code"] != 0 or result.get("oversized"):
+                raise ValueError("Cannot inspect Mach-O sections for %s (%s): %s" % (
+                    path, item["architecture"], text(result)[:512]))
+            sections = llvm_profile_sections(result["stdout"].decode("utf-8"), item["architecture"], item["uuid"])
+            binaries.append({"path": path, "architecture": item["architecture"], "llvmProfileSections": sections})
+    return performance.build_instrumentation({"schemaVersion": 1, "method": performance.INSTRUMENTATION_METHOD,
+        "binaries": binaries, "llvmProfileInstrumented": any(item["llvmProfileSections"] for item in binaries)}, identity)
+
+
+def performance_qualification(app, info, baseline_path, candidate_path, runner=None, now=None):
+    """Recompute the gate from raw reports; never trust a saved 'qualified' flag."""
+    detail = {"passed": False, "errors": [], "maximum_candidate_age_days": 7}
+    if baseline_path is None or candidate_path is None:
+        detail["errors"].append("Required evidence is missing: supply --performance-baseline and "
+                                "--performance-candidate raw Release component reports.")
+        return detail
+    try:
+        reports = []
+        for label, path in (("baseline", baseline_path), ("candidate", candidate_path)):
+            path = path.expanduser().resolve(strict=True)
+            contents = path.read_bytes()
+            detail[label] = {"path": str(path), "sha256": hashlib.sha256(contents).hexdigest()}
+            reports.append(json.loads(contents))
+        performance = load_release_module("compare_performance")
+        comparison = performance.compare(*reports, qualify=True, now=now)
+        detail["comparison"] = comparison
+        if not comparison["qualified"]:
+            detail["errors"].extend(comparison["conditionFailures"])
+            detail["errors"].extend("%s %s exceeds %s ms (%s ms observed)" % (
+                item["metric"], item["percentile"], item["budgetMilliseconds"], item["observedMilliseconds"])
+                for item in comparison["fixedBudgets"] if not item["met"])
+            detail["errors"].extend("%s %s regressed against the matched baseline" % (
+                item["metric"], item["percentile"]) for item in comparison["comparisons"] if item["regressed"])
+        expected = performance.artifact_identity(reports[1]["artifactIdentity"])
+        actual = capture_artifact_identity(app, info, runner=runner)
+        detail["artifact_identity"] = actual
+        actual_instrumentation = capture_build_instrumentation(app, actual, runner=runner)
+        detail["build_instrumentation"] = actual_instrumentation
+        expected_instrumentation = performance.build_instrumentation(reports[1].get("buildInstrumentation"), expected)
+        if actual_instrumentation != expected_instrumentation or actual_instrumentation["llvmProfileInstrumented"]:
+            detail["errors"].append("Candidate buildInstrumentation does not match the selected app or LLVM "
+                                    "profile/coverage sections are present; benchmark an uninstrumented build.")
+        if actual != expected:
+            detail["errors"].append("Candidate artifactIdentity does not match the selected app's "
+                                    "bundle/version/build or complete Mach-O UUID map; benchmark this build.")
+        detail["passed"] = comparison["qualified"] and not detail["errors"]
+    except (OSError, ValueError, TypeError, KeyError, ImportError) as error:
+        detail["errors"].append("Performance qualification could not be established: " + str(error))
+    return detail
 
 
 def development_files(app):
@@ -194,7 +357,7 @@ def runtime_loading(app, main_executable, binaries):
     return problems
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("artifact", type=Path)
@@ -202,11 +365,15 @@ def main():
     parser.add_argument("--minimum-os", default="27.0", help="Expected declared minimum macOS (default 27.0).")
     parser.add_argument("--expect-version", help="Required CFBundleShortVersionString, e.g. 1.0.")
     parser.add_argument("--expect-build", help="Required CFBundleVersion, e.g. 1.")
+    parser.add_argument("--performance-baseline", type=Path,
+                        help="Raw matching Release component baseline report; required to pass.")
+    parser.add_argument("--performance-candidate", type=Path,
+                        help="Raw qualifying component report for this app, at most 7 days old; required to pass.")
     parser.add_argument("--development-identity", action="store_true",
                         help="Expect Apple Development signing (Release configuration). Never distributable.")
     parser.add_argument("--no-worker-ping", action="store_true",
                         help="Do not start the worker; the ping check is then recorded as failed.")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if sys.platform != "darwin":
         parser.error("Run on macOS with Xcode command line tools installed.")
     if not re.fullmatch(r"\d+\.\d+(?:\.\d+)?", args.minimum_os):
@@ -319,6 +486,9 @@ def main():
     check("bundled_attributions", len(notices.encode()) > 10_000 and not absent,
           "Missing component notices: " + ", ".join(absent) if absent else str(notices_path))
     # Marker checks detect packaging omissions; license completeness still needs review.
+
+    performance = performance_qualification(app, info, args.performance_baseline, args.performance_candidate)
+    check("performance_qualification", performance["passed"], performance)
 
     if args.no_worker_ping:
         check("worker_ping_and_teardown", False, "Skipped by --no-worker-ping; the worker was not started.")

@@ -5,6 +5,10 @@ tool output only: no codesign, otool, real app, process sampling or network.
 Usage: python3 -I Release/test_release_tools.py
 """
 import importlib.util
+import contextlib
+import datetime
+import io
+import json
 import os
 from pathlib import Path
 import plistlib
@@ -12,6 +16,8 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
+from types import SimpleNamespace
 
 sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
@@ -27,6 +33,7 @@ def load(name):
 audit = load("audit_signatures")
 preflight = load("preflight")
 soak = load("soak")
+performance_fixture = load("test_compare_performance").report
 
 TEAM = "84PD63F63N"
 DEV_CN = "Apple Development: Example Person (AB12CD34EF)"
@@ -285,6 +292,260 @@ class AuditTests(unittest.TestCase):
         table = audit.render(report)
         self.assertIn("Keystorm.app", table)
         self.assertIn("Result: PASS", table)
+
+
+def otool_fixture(identifier, sections=("__text",), cputype=16777228, cpusubtype=0):
+    segment_size = 72 + 80 * len(sections)
+    lines = ["fixture:", "Mach header",
+             "magic cputype cpusubtype caps filetype ncmds sizeofcmds flags",
+             "0xfeedfacf %d %d 0x00 2 2 %d 0x00" % (cputype, cpusubtype, segment_size + 24),
+             "Load command 0", "cmd LC_SEGMENT_64", "cmdsize " + str(segment_size),
+             "nsects " + str(len(sections))]
+    for section in sections:
+        lines += ["Section", "sectname " + section]
+    return "\n".join(lines + ["Load command 1", "cmd LC_UUID", "cmdsize 24", "uuid " + identifier]) + "\n"
+
+
+class PerformancePreflightTests(unittest.TestCase):
+    def make_artifact(self, directory):
+        app = make_app(directory, [add_framework])
+        info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
+        info.update(CFBundleShortVersionString="1.0", CFBundleVersion="1",
+                    NSMicrophoneUsageDescription="Record dictation", LSMinimumSystemVersion="27.0")
+        (app / "Contents/Info.plist").write_bytes(plistlib.dumps(info))
+        return app, info
+
+    def uuid_runner(self, arguments, timeout=20, input_data=None):
+        identifier = ("01234567-89AB-CDEF-0123-456789ABCDEF" if Path(arguments[-1]).name == "Keystorm"
+                      else "11234567-89AB-CDEF-0123-456789ABCDEF")
+        if "lipo" in arguments:
+            self.assertEqual(arguments[:3], ["/usr/bin/xcrun", "lipo", "-archs"])
+            return {"code": 0, "stdout": b"arm64\n", "stderr": b"", "oversized": False}
+        if "otool" in arguments:
+            self.assertEqual(arguments[:6], ["/usr/bin/xcrun", "otool", "-arch", "arm64", "-h", "-l"])
+            return {"code": 0, "stdout": otool_fixture(identifier).encode(), "stderr": b"", "oversized": False}
+        self.assertEqual(arguments[:3], ["/usr/bin/xcrun", "dwarfdump", "--uuid"])
+        return {"code": 0, "stdout": ("UUID: %s (arm64) %s\n" % (identifier, arguments[-1])).encode(),
+                "stderr": b"", "oversized": False}
+
+    def write_reports(self, directory, app, info, mutate=None):
+        baseline, candidate = performance_fixture(), performance_fixture()
+        candidate["artifactIdentity"] = preflight.capture_artifact_identity(app, info, runner=self.uuid_runner)
+        candidate["buildInstrumentation"] = preflight.capture_build_instrumentation(app, candidate["artifactIdentity"], runner=self.uuid_runner)
+        baseline["artifactIdentity"] = candidate["artifactIdentity"]
+        baseline["buildInstrumentation"] = candidate["buildInstrumentation"]
+        if mutate:
+            mutate(candidate)
+        paths = Path(directory) / "baseline.json", Path(directory) / "candidate.json"
+        for path, value in zip(paths, (baseline, candidate)):
+            path.write_text(json.dumps(value))
+        return paths
+
+    def test_artifact_identity_covers_embedded_code_without_symlink_duplicates_or_tests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app, info = self.make_artifact(directory)
+            for relative in ("Contents/PlugIns/Tests.xctest/Contents/MacOS/Tests",
+                             "Contents/PlugIns/Tests.xctest.dSYM/Contents/Resources/DWARF/Tests",
+                             "Contents/_CodeSignature/test", "Contents/.git/test"):
+                path = app / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(thin_header())
+            identity = preflight.capture_artifact_identity(app, info, runner=self.uuid_runner)
+            self.assertEqual(set(identity["machoUUIDs"]), {
+                "Contents/MacOS/Keystorm", "Contents/Frameworks/Foo.framework/Versions/A/Foo"})
+            self.assertEqual(identity["mainExecutable"], "Contents/MacOS/Keystorm")
+            self.assertEqual(identity["buildNumber"], "1")
+
+    def test_unreadable_or_uuidless_macho_cannot_be_omitted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app, info = self.make_artifact(directory)
+            for response in ({"code": 1, "stdout": b"", "stderr": b"broken", "oversized": False},
+                             {"code": 0, "stdout": b"", "stderr": b"", "oversized": False}):
+                with self.subTest(response=response), self.assertRaises(ValueError):
+                    preflight.capture_artifact_identity(app, info, runner=lambda *args, **kwargs: response)
+
+    def test_architecture_inventory_cannot_omit_uuidless_fat_slices(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app, info = self.make_artifact(directory)
+            for mode in ("missing-slice", "duplicate-uuid", "duplicate-arch", "empty-arch", "failed-lipo"):
+                def runner(arguments, **kwargs):
+                    result = self.uuid_runner(arguments, **kwargs)
+                    if "lipo" in arguments:
+                        if mode == "missing-slice":
+                            result["stdout"] = b"arm64 x86_64\n"
+                        elif mode == "duplicate-arch":
+                            result["stdout"] = b"arm64 arm64\n"
+                        elif mode == "empty-arch":
+                            result["stdout"] = b""
+                        elif mode == "failed-lipo":
+                            result["code"] = 1
+                    elif "dwarfdump" in arguments and mode == "duplicate-uuid":
+                        result["stdout"] *= 2
+                    return result
+                with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, "architecture"):
+                    preflight.capture_artifact_identity(app, info, runner=runner)
+
+    def test_complete_fat_binary_instrumented_only_in_second_slice_is_detected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app, info = self.make_artifact(directory)
+            first = "01234567-89AB-CDEF-0123-456789ABCDEF"
+            second = "11234567-89AB-CDEF-0123-456789ABCDEF"
+            def runner(arguments, **kwargs):
+                if "lipo" in arguments:
+                    output = "arm64 x86_64\n"
+                elif "dwarfdump" in arguments:
+                    output = "UUID: %s (arm64) fixture\nUUID: %s (x86_64) fixture\n" % (first, second)
+                elif "otool" in arguments:
+                    if arguments[3] == "arm64":
+                        output = otool_fixture(first)
+                    else:
+                        self.assertEqual(arguments[3], "x86_64")
+                        output = otool_fixture(second, ("__text", "__llvm_prf_bits"), 16777223, 3)
+                else:
+                    self.fail("Unexpected command")
+                return {"code": 0, "stdout": output.encode(), "stderr": b"", "oversized": False}
+            identity = preflight.capture_artifact_identity(app, info, runner=runner)
+            instrumentation = preflight.capture_build_instrumentation(app, identity, runner=runner)
+            self.assertEqual(len(instrumentation["binaries"]), 4)
+            self.assertTrue(instrumentation["llvmProfileInstrumented"])
+            self.assertEqual({(item["architecture"], tuple(item["llvmProfileSections"]))
+                              for item in instrumentation["binaries"]},
+                             {("arm64", ()), ("x86_64", ("__llvm_prf_bits",))})
+            performance = preflight.load_release_module("compare_performance")
+            candidate = performance_fixture()
+            candidate.update(artifactIdentity=identity, buildInstrumentation=instrumentation)
+            with self.assertRaisesRegex(ValueError, "instrumentation must be absent"):
+                performance.compare(candidate, candidate, qualify=True)
+
+    def test_section_parser_rejects_missing_wrong_or_partial_architecture(self):
+        identifier = "01234567-89AB-CDEF-0123-456789ABCDEF"
+        valid = otool_fixture(identifier)
+        self.assertEqual(preflight.llvm_profile_sections(valid, "arm64", identifier), [])
+        instrumented = otool_fixture(identifier, ("__text", "__llvm_prf_cnts", "__llvm_covmap"))
+        self.assertEqual(preflight.llvm_profile_sections(instrumented, "arm64", identifier),
+                         ["__llvm_covmap", "__llvm_prf_cnts"])
+        malformed = ["", "fixture: No architecture found", valid.replace("16777228", "16777223"),
+                     valid.replace("16777228 0", "16777228 2"), valid + valid,
+                     valid.replace(identifier, "11234567-89AB-CDEF-0123-456789ABCDEF"),
+                     valid.replace("nsects 1", "nsects 2"), valid.replace("sectname __text", "sectname"),
+                     valid.replace("Load command 1", "Load command 3"),
+                     valid.replace("cmdsize 24", "cmdsize 25"), valid.replace("cmd LC_UUID", ""),
+                     valid.replace("nsects 1", "nsects broken"), valid.split("Load command 1")[0]]
+        for output in malformed:
+            with self.subTest(output=output), self.assertRaisesRegex(ValueError, "inspection"):
+                preflight.llvm_profile_sections(output, "arm64", identifier)
+        with self.assertRaisesRegex(ValueError, "inspection"):
+            preflight.llvm_profile_sections(valid, "unknown", identifier)
+        self.assertEqual(preflight.llvm_profile_sections(
+            otool_fixture(identifier, cputype=16777223, cpusubtype=3), "x86_64", identifier), [])
+
+    def test_actual_app_instrumentation_cannot_be_hidden_by_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app, info = self.make_artifact(directory)
+            paths = self.write_reports(directory, app, info)
+            def runner(arguments, **kwargs):
+                result = self.uuid_runner(arguments, **kwargs)
+                if "otool" in arguments and Path(arguments[-1]).name != "Keystorm":
+                    identifier = "11234567-89AB-CDEF-0123-456789ABCDEF"
+                    result["stdout"] = otool_fixture(identifier, ("__text", "__llvm_prf_names")).encode()
+                return result
+            result = preflight.performance_qualification(app, info, *paths, runner=runner)
+            self.assertFalse(result["passed"], result)
+            self.assertTrue(result["build_instrumentation"]["llvmProfileInstrumented"])
+            for bad in ({"code": 0, "stdout": b"", "stderr": b"", "oversized": False},
+                        {"code": 1, "stdout": b"", "stderr": b"tool failed", "oversized": False},
+                        {"code": 0, "stdout": b"", "stderr": b"", "oversized": True}):
+                def broken(arguments, **kwargs):
+                    return bad if "otool" in arguments else self.uuid_runner(arguments, **kwargs)
+                with self.subTest(response=bad):
+                    self.assertFalse(preflight.performance_qualification(app, info, *paths, runner=broken)["passed"])
+
+    def test_missing_either_raw_report_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app, info = self.make_artifact(directory)
+            for baseline, candidate in ((None, None), (Path(directory) / "absent.json", None),
+                                        (None, Path(directory) / "absent.json"),
+                                        (Path(directory) / "absent.json", Path(directory) / "absent.json")):
+                result = preflight.performance_qualification(app, info, baseline, candidate, runner=self.uuid_runner)
+                self.assertFalse(result["passed"])
+                self.assertTrue(result["errors"])
+
+    def test_matching_fresh_raw_evidence_passes_without_trusting_report_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app, info = self.make_artifact(directory)
+            paths = self.write_reports(directory, app, info)
+            result = preflight.performance_qualification(app, info, *paths, runner=self.uuid_runner)
+            self.assertTrue(result["passed"], result)
+            self.assertTrue(result["comparison"]["qualified"])
+
+    def test_failed_stale_malformed_or_mismatched_candidate_never_passes(self):
+        def missed_budget(report):
+            report["qualified"] = True
+            for sample in report["passes"]:
+                sample["finishToCleanMilliseconds"] = 2000
+
+        mutations = [missed_budget,
+                     lambda report: report.update(qualificationFailures=["native invariant failed"]),
+                     lambda report: report.pop("hostWorkspaceInitialized"),
+                     lambda report: report["passes"][-1]["resourcesAfterPass"].pop("textModelLoads"),
+                     lambda report: report.update(generatedAt=(datetime.datetime.now(datetime.timezone.utc)
+                                                               - datetime.timedelta(days=8)).isoformat()),
+                     lambda report: report["artifactIdentity"].update(buildNumber="other-build"),
+                     lambda report: report["artifactIdentity"]["machoUUIDs"].pop(
+                         "Contents/Frameworks/Foo.framework/Versions/A/Foo"),
+                     lambda report: report["artifactIdentity"]["machoUUIDs"][
+                         "Contents/Frameworks/Foo.framework/Versions/A/Foo"][0].update(
+                             uuid="21234567-89AB-CDEF-0123-456789ABCDEF"),
+                     lambda report: report.update(operatingSystem="other OS")]
+        with tempfile.TemporaryDirectory() as directory:
+            app, info = self.make_artifact(directory)
+            for mutate in mutations:
+                paths = self.write_reports(directory, app, info, mutate)
+                with self.subTest(mutation=mutate):
+                    result = preflight.performance_qualification(app, info, *paths, runner=self.uuid_runner)
+                    self.assertFalse(result["passed"], result)
+                    self.assertTrue(result["errors"], result)
+            paths[1].write_text('{"broken":')
+            self.assertFalse(preflight.performance_qualification(app, info, *paths, runner=self.uuid_runner)["passed"])
+
+    def test_preflight_cli_requires_performance_check_for_overall_success(self):
+        def fake_command(arguments, timeout=20, input_data=None):
+            stdout = b""
+            if "dwarfdump" in arguments or "lipo" in arguments or ("otool" in arguments and "-h" in arguments):
+                return self.uuid_runner(arguments, timeout, input_data)
+            if "-archs" in arguments:
+                stdout = b"arm64"
+            elif "-show-build" in arguments:
+                stdout = b"minos 27.0"
+            elif "--entitlements" in arguments:
+                stdout = plistlib.dumps({"com.apple.security.device.audio-input": True})
+            elif "--display" in arguments:
+                stdout = b"Authority=Developer ID Application: Example\nflags=0x10000(runtime)"
+            elif input_data:
+                request = json.loads(input_data[len(preflight.PREFIX):])
+                stdout = preflight.PREFIX + json.dumps({"version": 1, "id": request["id"],
+                                                       "succeeded": True, "processID": 42}).encode() + b"\n"
+            return {"code": 0, "stdout": stdout, "stderr": b"", "oversized": False}
+
+        with tempfile.TemporaryDirectory() as directory:
+            app, info = self.make_artifact(directory)
+            (app / "Contents/Resources/ThirdPartyNotices.txt").write_text(" ".join(preflight.COMPONENTS) + "x" * 11000)
+            paths = self.write_reports(directory, app, info)
+            audit_stub = SimpleNamespace(audit=lambda *args, **kwargs: {"passed": True, "findings": [], "items": []})
+            with mock.patch.object(preflight, "command", fake_command), \
+                    mock.patch.object(preflight, "load_audit_module", return_value=audit_stub), \
+                    mock.patch.object(preflight.sys, "platform", "darwin"):
+                for supplied, expected in ((False, 1), (True, 0)):
+                    arguments = [str(app)]
+                    if supplied:
+                        arguments += ["--performance-baseline", str(paths[0]), "--performance-candidate", str(paths[1])]
+                    output = io.StringIO()
+                    with contextlib.redirect_stdout(output):
+                        status = preflight.main(arguments)
+                    result = json.loads(output.getvalue())
+                    self.assertEqual(status, expected, result)
+                    check = next(item for item in result["checks"] if item["check"] == "performance_qualification")
+                    self.assertEqual(check["passed"], supplied)
 
 
 class PreflightTests(unittest.TestCase):

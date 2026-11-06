@@ -36,6 +36,7 @@ final class AppInteractionController {
     @ObservationIgnored private var legacyRecordingTask: Task<Void, Never>?
     @ObservationIgnored private var recordingHUD: RecordingHUDController?
     @ObservationIgnored private var recordingHUDObservation: UUID?
+    @ObservationIgnored private var preparedDictationMode: DictationQuickMode?
     private(set) var readbackBlockRanges: [UUID: NSRange] = [:]
 
     /// Tests pass a shortcut manager with a private defaults suite so preferences never reach the real ones.
@@ -64,6 +65,7 @@ final class AppInteractionController {
         }, onOpenBrief: { [weak self] in self?.perform(.showWorkspace) })
         recordingHUDObservation = UUID()
         observeRecordingHUD()
+        observeDictationWarmup()
         hold = HoldRecordingCoordinator(
             isRecording: { [weak recording] in recording?.isRecording == true },
             start: { [weak recording, weak self] in
@@ -301,6 +303,29 @@ final class AppInteractionController {
     func waitForRecordingControls() async {
         await legacyRecordingTask?.value
         await hold?.waitForSettled()
+    }
+
+    /// Event-driven idle preparation. Busy changes allow a pending mode selection to retry;
+    /// the remembered selection prevents the warm-up's own completion from scheduling it again.
+    private func observeDictationWarmup() {
+        guard let workspace, let dictation, let generation = recordingHUDObservation else { return }
+        var mode = DictationQuickMode.verbatim
+        var installed = false
+        var idle = false
+        withObservationTracking {
+            mode = dictation.preferences.mode
+            installed = workspace.installedModelIDs.contains(ModelCatalog.primaryText.id)
+            idle = !workspace.isBusy && !workspace.isRecording && !workspace.isCaptureTransitioning
+        } onChange: { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, self.recordingHUDObservation == generation else { return }
+                self.observeDictationWarmup()
+            }
+        }
+        if !installed || !mode.transformsOnFinish { preparedDictationMode = nil; return }
+        if preparedDictationMode != mode, idle, workspace.prepareNextDictation(mode: mode) {
+            preparedDictationMode = mode
+        }
     }
 
     /// Observation re-arms only after a relevant change. The capture clock already runs;

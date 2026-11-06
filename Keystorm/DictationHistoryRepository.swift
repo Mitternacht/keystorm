@@ -54,8 +54,9 @@ struct DictationHistoryMaintenance: Sendable {
 /// Borrows the single catalog connection owned by SessionStore. Version 3 adds
 /// disposable take headers, not another source of recording or audio authority.
 /// Version 4 upgrades early version 3 catalogs whose headers lacked a source count.
+/// Version 5 requires readers to replay the typed transcription entries in the journal.
 struct DictationHistoryRepository {
-    static let catalogVersion: Int32 = 4
+    static let catalogVersion: Int32 = 5
     static let maximumPageSize = 100
     private static let validTakeIdentity = "length(d.take_id)=36 AND substr(d.take_id,9,1)='-' AND substr(d.take_id,14,1)='-' AND substr(d.take_id,19,1)='-' AND substr(d.take_id,24,1)='-' AND length(replace(d.take_id,'-',''))=32 AND replace(d.take_id,'-','') NOT GLOB '*[^0-9A-Fa-f]*'"
     enum FaultPoint { case migrationBeforeCommit }
@@ -127,7 +128,7 @@ struct DictationHistoryRepository {
                     """)
                 try bumpGeneration()
             }
-            try execute("PRAGMA user_version=4")
+            try execute("PRAGMA user_version=5")
             try fault?(.migrationBeforeCommit)
             try execute("COMMIT")
         } catch { try? execute("ROLLBACK"); throw error }

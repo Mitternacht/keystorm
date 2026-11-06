@@ -9,7 +9,9 @@ struct DictationCaptureIntegrationTests {
     /// Captures ambient samples without playing speech or asking a person to speak.
     /// Existing permission is required; the test never requests a permission prompt.
     @Test("The real microphone tap resumes one durable dictation take",
-          .enabled(if: ProcessInfo.processInfo.environment["KEYSTORM_RUN_DICTATION_CAPTURE"] == "1"),
+          .enabled(if: ProcessInfo.processInfo.environment["KEYSTORM_RUN_DICTATION_CAPTURE"] == "1"
+              || (try? String(contentsOfFile: "/tmp/Keystorm-Hardware-validation.flag", encoding: .utf8)
+                  .trimmingCharacters(in: .whitespacesAndNewlines)) == "capture-and-delivery"),
           .exclusiveModelUse,
           .timeLimit(.minutes(3)))
     func authorizedMicrophonePauseResume() async throws {
@@ -21,17 +23,22 @@ struct DictationCaptureIntegrationTests {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("Keystorm-DictationCapture-\(UUID().uuidString)")
         let model = WorkspaceModel(root: root, modelDirectory: models)
         var reopened: WorkspaceModel?
+        var workspaceCallMilliseconds: [String: Double] = [:]
         do {
             await model.initialize(loadLibrary: true)
             try #require(model.error == nil, "\(model.error ?? "")")
             try #require(model.installedModelIDs.contains(ModelCatalog.primarySpeech.id),
                 "The pinned local speech model must already be installed.")
+            let beginStarted = ContinuousClock.now
             let handle = try await model.dictationBegin()
+            workspaceCallMilliseconds["begin"] = milliseconds(since: beginStarted)
             #expect(model.isRecording)
             #expect(model.openTake?.id == handle.takeID)
             #expect(model.dictationMetadata(handle)?.state == .recording)
             try await Task.sleep(for: .milliseconds(800))
+            let firstPauseStarted = ContinuousClock.now
             try await model.dictationPause(handle)
+            workspaceCallMilliseconds["firstPause"] = milliseconds(since: firstPauseStarted)
             #expect(!model.isRecording)
             #expect(!model.isCaptureTransitioning)
             #expect(model.canResumeTake)
@@ -47,12 +54,16 @@ struct DictationCaptureIntegrationTests {
             #expect(abs(model.takeElapsed - elapsedWhilePaused) < 0.000_001)
             #expect(!model.isRecording)
 
+            let resumeStarted = ContinuousClock.now
             try await model.dictationResume(handle)
+            workspaceCallMilliseconds["resume"] = milliseconds(since: resumeStarted)
             #expect(model.isRecording)
             #expect(model.openTake?.id == handle.takeID)
             #expect(model.dictationMetadata(handle)?.state == .recording)
             try await Task.sleep(for: .milliseconds(800))
+            let secondPauseStarted = ContinuousClock.now
             try await model.dictationPause(handle)
+            workspaceCallMilliseconds["secondPause"] = milliseconds(since: secondPauseStarted)
             let saved = try snapshot(model, handle: handle)
             let take = try #require(saved.brief?.takes.first { $0.id == handle.takeID })
             let audio = saved.takeSegments(take)
@@ -100,7 +111,8 @@ struct DictationCaptureIntegrationTests {
             let report = CaptureIntegrationReport(handle: handle, authorization: authorization.rawValue,
                 intervalIDs: intervals, sourceFrames: audio.map(\.frameCount), sampleRates: audio.map(\.sampleRate),
                 sourceHashes: audio.map(\.sha256), logicalAudioSeconds: totalSeconds,
-                pausedWallSeconds: resumedAt.timeIntervalSince(firstEnded), recoveredSameTake: restored.brief?.takes.first?.id == handle.takeID)
+                pausedWallSeconds: resumedAt.timeIntervalSince(firstEnded), recoveredSameTake: restored.brief?.takes.first?.id == handle.takeID,
+                workspaceCallMilliseconds: workspaceCallMilliseconds)
             try attach(report, named: "dictation-microphone-pause-resume.json")
             try FileManager.default.removeItem(at: root)
         } catch {
@@ -257,12 +269,20 @@ struct DictationCaptureIntegrationTests {
         return latest
     }
 
+    private func milliseconds(since start: ContinuousClock.Instant) -> Double {
+        let duration = start.duration(to: .now).components
+        return Double(duration.seconds) * 1_000 + Double(duration.attoseconds) / 1_000_000_000_000_000
+    }
+
     private func attach<T: Encodable>(_ value: T, named name: String) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(value)
         Attachment.record(data, named: name)
-        if let parent = ProcessInfo.processInfo.environment["KEYSTORM_DICTATION_REPORT_DIRECTORY"] {
+        if let parent = ProcessInfo.processInfo.environment["KEYSTORM_DICTATION_REPORT_DIRECTORY"]
+            ?? ((try? String(contentsOfFile: "/tmp/Keystorm-Hardware-validation.flag", encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines)) == "capture-and-delivery"
+                ? "/tmp/Keystorm-HardwareEvidence" : nil) {
             let directory = URL(fileURLWithPath: parent, isDirectory: true)
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             try data.write(to: directory.appendingPathComponent(name), options: .atomic)
@@ -281,10 +301,12 @@ private struct CaptureIntegrationReport: Encodable {
     let logicalAudioSeconds: Double
     let pausedWallSeconds: Double
     let recoveredSameTake: Bool
+    let workspaceCallMilliseconds: [String: Double]
+    let timingScope = "One begin, resume and two pause calls on WorkspaceModel, including their production setup or durable drain. No physical key dispatch, UI paint, natural-speech accuracy or latency-percentile qualification."
 
     init(handle: DictationRecordingHandle, authorization: Int, intervalIDs: [UUID], sourceFrames: [Int64],
          sampleRates: [Double], sourceHashes: [String], logicalAudioSeconds: Double,
-         pausedWallSeconds: Double, recoveredSameTake: Bool) {
+         pausedWallSeconds: Double, recoveredSameTake: Bool, workspaceCallMilliseconds: [String: Double]) {
         self.handle = CaptureReportHandle(sessionID: handle.sessionID, takeID: handle.takeID)
         self.authorization = authorization
         self.intervalIDs = intervalIDs
@@ -294,6 +316,7 @@ private struct CaptureIntegrationReport: Encodable {
         self.logicalAudioSeconds = logicalAudioSeconds
         self.pausedWallSeconds = pausedWallSeconds
         self.recoveredSameTake = recoveredSameTake
+        self.workspaceCallMilliseconds = workspaceCallMilliseconds
     }
 }
 private struct CaptureReportHandle: Encodable { let sessionID: UUID; let takeID: UUID }

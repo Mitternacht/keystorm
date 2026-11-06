@@ -25,6 +25,12 @@ final class InferenceWorkerFootprintGuard: @unchecked Sendable {
         lock.unlock()
     }
 
+    func endRequest() {
+        lock.lock()
+        requestID = nil
+        lock.unlock()
+    }
+
     func statistics() -> [String: UInt64] {
         lock.lock()
         defer { lock.unlock() }
@@ -72,22 +78,7 @@ enum InferenceWorkerDaemon {
         let parent = getppid()
         guard parent > 1 else { return }
         let footprintGuard = InferenceWorkerFootprintGuard()
-        let watchdog = Task.detached {
-            while !Task.isCancelled {
-                do { try await Task.sleep(for: .milliseconds(100)) } catch { return }
-                if getppid() != parent { Darwin.exit(0) }
-                // This sampler remains runnable while a synchronous Metal/Core ML job
-                // occupies the engine actor. Exceeding the shared ceiling kills only
-                // this disposable child; capture and durable files live in the parent.
-                if let failure = footprintGuard.failureReplyIfExceeded(by: LocalInference.processFootprint(), processID: getpid()) {
-                    // This source-free diagnostic frame stays below PIPE_BUF. It is
-                    // emitted only at fail-stop, while no normal reply is pending.
-                    if let frame = try? InferenceWorkerCodec.frame(failure) { try? output.write(contentsOf: frame) }
-                    Darwin.exit(75)
-                }
-            }
-        }
-        defer { watchdog.cancel(); try? output.close() }
+        defer { try? output.close() }
         let engine = LocalInference(modelDirectory: models)
         let reader = InferenceWorkerFrameReader(file: .standardInput)
         while !Task.isCancelled {
@@ -98,6 +89,24 @@ enum InferenceWorkerDaemon {
                 let request = try InferenceWorkerCodec.decode(InferenceWorkerRequest.self, from: line)
                 guard request.version == 1 else { break }
                 footprintGuard.setRequest(request.id)
+                // While idle, the blocking protocol read exits on the parent's pipe EOF.
+                // Only active work needs periodic memory and parent-liveness sampling.
+                let watchdog: Task<Void, Never>? = [.ping, .memory].contains(request.operation) ? nil : Task.detached {
+                    while !Task.isCancelled {
+                        do { try await Task.sleep(for: .milliseconds(100)) } catch { return }
+                        if getppid() != parent { Darwin.exit(0) }
+                        // This sampler remains runnable while a synchronous Metal/Core ML job
+                        // occupies the engine actor. Exceeding the shared ceiling kills only
+                        // this disposable child; capture and durable files live in the parent.
+                        if let failure = footprintGuard.failureReplyIfExceeded(by: LocalInference.processFootprint(), processID: getpid()) {
+                            // This source-free diagnostic frame stays below PIPE_BUF. It is
+                            // emitted only at fail-stop, while no normal reply is pending.
+                            if let frame = try? InferenceWorkerCodec.frame(failure) { try? output.write(contentsOf: frame) }
+                            Darwin.exit(75)
+                        }
+                    }
+                }
+                defer { watchdog?.cancel(); footprintGuard.endRequest() }
                 var reply = InferenceWorkerReply(id: request.id, processID: getpid())
                 do {
                     if [.prepareSpeech, .prepareText, .speechPreview, .speech, .extraction, .edit, .transform, .classifyCorrection].contains(request.operation) {
@@ -176,6 +185,11 @@ enum InferenceWorkerDaemon {
                     reply.error = String(error.localizedDescription.prefix(2_048))
                     reply.transformFailure = error as? DictationTransformGenerationFailure
                 }
+                // Join before publishing a normal reply or admitting the next request, so a
+                // sampler from the preceding job cannot observe the next job's identity.
+                watchdog?.cancel()
+                await watchdog?.value
+                footprintGuard.endRequest()
                 reply.memory = await engine.memorySnapshot()
                 reply.memory.merge(footprintGuard.statistics()) { _, value in value }
                 reply.memory["integrityVerificationCount"] = UInt64(await engine.integrityVerificationCount)

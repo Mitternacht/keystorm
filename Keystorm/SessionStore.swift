@@ -4,8 +4,39 @@ import CryptoKit
 import Darwin
 import AVFoundation
 
+/// A capacity rejection is issued before beginning the journal transaction, so a
+/// caller may reconcile its provisional UI state with the last durable snapshot.
+enum SessionMetadataCapacityError: LocalizedError, Equatable {
+    case incrementalLimitReached
+    case snapshotLimitReached
+
+    var errorDescription: String? {
+        switch self {
+        case .incrementalLimitReached:
+            "Session metadata is full. Pause and export this recording, then start another before adding more material."
+        case .snapshotLimitReached:
+            "Session metadata exceeds the 64 MB storage limit. Export or start another brief before adding more material."
+        }
+    }
+}
+
 /// Single-writer catalog. Audio is committed by the recorder before this actor acknowledges it.
 actor SessionStore {
+    static let maximumSnapshotBytes = 64 * 1_024 * 1_024
+    // This is the largest incremental budget. A session with many open intervals
+    // reserves more for ordinary Pause; arbitrary future edits/error text must
+    // still pass the full-save hard cap.
+    static let maximumIncrementalMetadataBytes = maximumSnapshotBytes - 4_096
+
+    static func incrementalMetadataLimit(for session: VoiceSession) -> Int {
+        let openIntervals = session.intervals.lazy.filter { $0.endedAt == nil }.count
+        let recordingTakes = session.brief?.takes.lazy.filter { $0.status == .recording }.count ?? 0
+        // An interval gains endedAt and may grow hostTime from 0 to UInt64.max.
+        // Each dictation take can grow an updatedAt number; its paused status and
+        // removal of failureMessage do not grow. Root dates/revision have slack.
+        let reserve = max(4_096, 256 + 96 * openIntervals + 64 * recordingTakes)
+        return max(0, maximumSnapshotBytes - reserve)
+    }
     private let root: URL
     private let catalog: SQLiteCatalog
     private let encoder = JSONEncoder()
@@ -39,6 +70,8 @@ actor SessionStore {
         var segmentsByID: [UUID: AudioSegment]
         var dataVersion: Int32
         var stamp: SnapshotStamp?
+        var metadataUpperBound: Int
+        var metadataLimit: Int
     }
 
     private struct Snapshot: Codable {
@@ -194,7 +227,7 @@ actor SessionStore {
 
     /// Snapshot rename precedes SQLite commit. Recovery chooses the higher monotonic revision.
     /// Neither the database transaction nor JSON snapshot is claimed to commit the audio itself.
-    func save(_ session: VoiceSession) throws {
+    func save(_ session: VoiceSession, reservingPauseMetadata: Bool = false) throws {
         // Invalidate before any publication attempt: JSON may succeed even when SQL fails.
         appendCache = nil
         guard session.schemaVersion == 1 else { throw KeystormError.message("Unsupported session schema \(session.schemaVersion).") }
@@ -221,8 +254,13 @@ actor SessionStore {
         }
         let snapshot = Snapshot(revision: (previous?.revision ?? 0) + 1, session: session)
         let data = try encoder.encode(snapshot)
-        guard data.count <= 64 * 1_024 * 1_024 else {
-            throw KeystormError.message("Session metadata exceeds the 64 MB storage limit. Export or start another brief before adding more material.")
+        guard data.count <= Self.maximumSnapshotBytes else {
+            throw SessionMetadataCapacityError.snapshotLimitReached
+        }
+        // A speech mutation may need a full checkpoint to reconcile pending edits.
+        // Its encoding choice must not consume the space needed to close capture.
+        if reservingPauseMetadata, data.count > Self.incrementalMetadataLimit(for: session) {
+            throw SessionMetadataCapacityError.incrementalLimitReached
         }
         try DurableFile.replace(data, at: sessionDirectory(session.id).appendingPathComponent("session.json"))
         try catalog.putSession(id: session.id, revision: snapshot.revision, payload: encoder.encode(session), snapshotStamp: snapshotStampValue(session.id))
@@ -236,6 +274,100 @@ actor SessionStore {
               updatedAt.timeIntervalSinceReferenceDate.isFinite else {
             throw KeystormError.message("The captured audio batch has invalid identities or bounds.")
         }
+        try prepareAppendCache(sessionID)
+        guard let baseline = appendCache?.snapshot else {
+            throw KeystormError.message("The recording checkpoint is unavailable.")
+        }
+        var fresh: [AudioSegment] = []
+        for segment in segments {
+            if let existing = appendCache?.segmentsByID[segment.id] {
+                guard existing == segment else {
+                    throw KeystormError.message("An acknowledged capture identity cannot be rewritten.")
+                }
+            } else { fresh.append(segment) }
+        }
+        guard !fresh.isEmpty else { return baseline.session }
+        try validateCaptureOwnership(fresh, in: baseline.session)
+        let directory = try audioDirectory(sessionID)
+        for segment in fresh {
+            _ = try audioURL(for: segment, in: sessionID)
+            try validatePublicationSegment(segment, in: directory)
+        }
+        guard baseline.revision < Int64.max else {
+            throw KeystormError.message("The session revision limit has been reached.")
+        }
+        let proposal = IncrementalSessionJournal.CaptureDelta(sessionID: sessionID,
+            revision: baseline.revision + 1, segments: fresh, updatedAt: updatedAt)
+        let metadataUpperBound = try metadataBudget(after: encoder.encode(proposal).count, baseline: baseline) {
+            var candidate = baseline.session
+            candidate.segments.append(contentsOf: fresh)
+            candidate.invalidateDerivedWork()
+            candidate.updatedAt = updatedAt
+            return candidate
+        }
+        let delta = try catalog.appendCapture(sessionID: sessionID, expectedRevision: baseline.revision,
+            segments: fresh, updatedAt: updatedAt)
+        // All fallible work precedes the in-memory publication. SQL owns duplicate/range
+        // validation; the cache is updated only after its FULL-synchronous commit.
+        guard var cache = appendCache else { preconditionFailure("Capture cache lost inside serialized storage") }
+        appendCache = nil
+        if let last = cache.snapshot.session.segments.last, let first = delta.segments.first,
+           last.startTime > first.startTime {
+            cache.snapshot.session.segments.append(contentsOf: delta.segments)
+            cache.snapshot.session.segments.sort { $0.startTime < $1.startTime }
+        } else {
+            cache.snapshot.session.segments.append(contentsOf: delta.segments)
+        }
+        for segment in delta.segments { cache.segmentsByID[segment.id] = segment }
+        cache.snapshot.session.invalidateDerivedWork()
+        cache.snapshot.session.updatedAt = delta.updatedAt
+        cache.snapshot.revision = delta.revision
+        cache.metadataUpperBound = metadataUpperBound
+        appendCache = cache
+        return cache.snapshot.session
+    }
+
+    /// Persists only one speech job transition and its newly appended output. The
+    /// source checkpoint is unchanged until a deliberate full metadata save.
+    func saveTranscriptionUpdate(_ session: VoiceSession) throws {
+        try prepareAppendCache(session.id)
+        guard let baseline = appendCache?.snapshot else {
+            throw KeystormError.message("The transcription checkpoint is unavailable.")
+        }
+        guard Set(session.segments.map(\.id)).count == session.segments.count,
+              Set(session.transcripts.map(\.id)).count == session.transcripts.count else {
+            throw KeystormError.message("Duplicate source record identities cannot be committed.")
+        }
+        // Preserve byte-exact original text, including canonically equivalent Unicode.
+        try preserveOriginals(baseline.session, in: session)
+        var normalized = session
+        normalized.updatedAt = baseline.session.updatedAt
+        if baseline.session == normalized { return }
+        let change = try IncrementalSessionJournal.TranscriptionChange.between(baseline.session, and: session)
+        guard baseline.revision < Int64.max else {
+            throw KeystormError.message("The session revision limit has been reached.")
+        }
+        let delta = IncrementalSessionJournal.CaptureDelta(version: 2, sessionID: session.id,
+            revision: baseline.revision + 1, segments: [], updatedAt: session.updatedAt, transcription: change)
+        // Unusual large outputs remain supported by the existing bounded full-save
+        // path; never split one logical output across independently visible commits.
+        let deltaBytes = try encoder.encode(delta).count
+        let metadataUpperBound = try metadataBudget(after: deltaBytes, baseline: baseline) { session }
+        if deltaBytes > IncrementalSessionJournal.maximumDeltaBytes {
+            try save(session)
+            return
+        }
+        let committed = try catalog.appendTranscription(sessionID: session.id,
+            expectedRevision: baseline.revision, change: change, updatedAt: session.updatedAt)
+        guard var cache = appendCache else { preconditionFailure("Transcription cache lost inside serialized storage") }
+        appendCache = nil
+        cache.snapshot.session = session
+        cache.snapshot.revision = committed.revision
+        cache.metadataUpperBound = metadataUpperBound
+        appendCache = cache
+    }
+
+    private func prepareAppendCache(_ sessionID: UUID) throws {
         let stamp = try snapshotStamp(sessionID)
         let dataVersion = try catalog.dataVersion()
         let durableRevision = try catalog.captureRevision(sessionID)
@@ -255,45 +387,32 @@ actor SessionStore {
             }
             appendCache = CaptureCache(snapshot: entry,
                 segmentsByID: Dictionary(uniqueKeysWithValues: entry.session.segments.map { ($0.id, $0) }),
-                dataVersion: try catalog.dataVersion(), stamp: try snapshotStamp(sessionID))
+                dataVersion: try catalog.dataVersion(), stamp: try snapshotStamp(sessionID),
+                metadataUpperBound: try encoder.encode(entry).count,
+                metadataLimit: Self.incrementalMetadataLimit(for: entry.session))
         }
-        guard let baseline = appendCache?.snapshot else {
-            throw KeystormError.message("The recording checkpoint is unavailable.")
+    }
+
+    /// The delta encodes every new/replacement record and more envelope data than
+    /// the checkpoint gains. The extra allowance covers revision/date growth, the
+    /// brief's appended transcript UUID, and true-to-false fact flags. Near capacity,
+    /// rebase to the exact candidate size so conservative charges never reject a
+    /// session that still fits. Normal tiny appends never encode the full history.
+    private func metadataBudget(after deltaBytes: Int, baseline: Snapshot,
+                                candidate: () -> VoiceSession) throws -> Int {
+        guard let current = appendCache?.metadataUpperBound,
+              let limit = appendCache?.metadataLimit else {
+            throw KeystormError.message("The recording metadata budget is unavailable.")
         }
-        var fresh: [AudioSegment] = []
-        for segment in segments {
-            if let existing = appendCache?.segmentsByID[segment.id] {
-                guard existing == segment else {
-                    throw KeystormError.message("An acknowledged capture identity cannot be rewritten.")
-                }
-            } else { fresh.append(segment) }
+        let allowance = deltaBytes + 128 + baseline.session.facts.count
+        if current <= limit, allowance <= limit - current {
+            return current + allowance
         }
-        guard !fresh.isEmpty else { return baseline.session }
-        try validateCaptureOwnership(fresh, in: baseline.session)
-        let directory = try audioDirectory(sessionID)
-        for segment in fresh {
-            _ = try audioURL(for: segment, in: sessionID)
-            try validatePublicationSegment(segment, in: directory)
+        let exact = try encoder.encode(Snapshot(revision: baseline.revision + 1, session: candidate())).count
+        guard exact <= limit else {
+            throw SessionMetadataCapacityError.incrementalLimitReached
         }
-        let delta = try catalog.appendCapture(sessionID: sessionID, expectedRevision: baseline.revision,
-            segments: fresh, updatedAt: updatedAt)
-        // All fallible work precedes the in-memory publication. SQL owns duplicate/range
-        // validation; the cache is updated only after its FULL-synchronous commit.
-        guard var cache = appendCache else { preconditionFailure("Capture cache lost inside serialized storage") }
-        appendCache = nil
-        if let last = cache.snapshot.session.segments.last, let first = delta.segments.first,
-           last.startTime > first.startTime {
-            cache.snapshot.session.segments.append(contentsOf: delta.segments)
-            cache.snapshot.session.segments.sort { $0.startTime < $1.startTime }
-        } else {
-            cache.snapshot.session.segments.append(contentsOf: delta.segments)
-        }
-        for segment in delta.segments { cache.segmentsByID[segment.id] = segment }
-        cache.snapshot.session.invalidateDerivedWork()
-        cache.snapshot.session.updatedAt = delta.updatedAt
-        cache.snapshot.revision = delta.revision
-        appendCache = cache
-        return cache.snapshot.session
+        return exact
     }
 
     private func validateCaptureOwnership(_ segments: [AudioSegment], in session: VoiceSession) throws {
@@ -1039,7 +1158,7 @@ actor SessionStore {
         guard Set(result.session.segments.map(\.id)).count == result.session.segments.count else {
             throw KeystormError.message("The capture checkpoint contains duplicate sources.")
         }
-        var known = Set(result.session.segments.map(\.id))
+        var transcriptionState = try IncrementalSessionJournal.TranscriptionReplayState(result.session)
         var ordered = result.session.segments.sorted { $0.startTime < $1.startTime }
         guard zip(ordered, ordered.dropFirst()).allSatisfy({ !Self.overlaps($0.0, $0.1) }) else {
             throw KeystormError.message("The capture checkpoint has conflicting audio ranges.")
@@ -1053,11 +1172,14 @@ actor SessionStore {
                 guard delta.revision == result.revision + 1, delta.revision <= expected else {
                     throw KeystormError.message("The capture journal changed during recovery.")
                 }
+                if let change = delta.transcription {
+                    try transcriptionState.apply(change, to: &result.session, updatedAt: delta.updatedAt)
+                    result.revision = delta.revision
+                    continue
+                }
                 try validateCaptureOwnership(delta.segments, in: result.session)
                 for segment in delta.segments {
-                    guard known.insert(segment.id).inserted else {
-                        throw KeystormError.message("The capture journal repeats an immutable source.")
-                    }
+                    try transcriptionState.appendSource(segment)
                     // Binary neighbors suffice because insertion retains sorted disjoint
                     // acknowledged capture ranges. No historical audio file is reread here.
                     var low = 0, high = ordered.count
@@ -1071,7 +1193,7 @@ actor SessionStore {
                     }
                     ordered.insert(segment, at: low)
                 }
-                result.session.invalidateDerivedWork()
+                transcriptionState.invalidateDerivedWork(in: &result.session)
                 result.session.updatedAt = delta.updatedAt
                 result.revision = delta.revision
             }
@@ -1321,6 +1443,14 @@ private final class SQLiteCatalog: @unchecked Sendable {
         guard let connection else { throw failure() }
         return try IncrementalSessionJournal(connection: connection).append(sessionID: sessionID,
             expectedRevision: expectedRevision, segments: segments, updatedAt: updatedAt)
+    }
+
+    func appendTranscription(sessionID: UUID, expectedRevision: Int64,
+                             change: IncrementalSessionJournal.TranscriptionChange,
+                             updatedAt: Date) throws -> IncrementalSessionJournal.CaptureDelta {
+        guard let connection else { throw failure() }
+        return try IncrementalSessionJournal(connection: connection).append(sessionID: sessionID,
+            expectedRevision: expectedRevision, segments: [], updatedAt: updatedAt, transcription: change)
     }
 
     func containsSession(_ id: UUID) throws -> Bool {

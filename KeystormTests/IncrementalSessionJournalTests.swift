@@ -4,6 +4,43 @@ import Testing
 @testable import Keystorm
 
 struct IncrementalSessionJournalTests {
+
+    @Test("A failed transcription transaction leaves the job and header at their previous revision",
+          arguments: [0, 1])
+    func transcriptionRollback(boundary: Int) throws {
+        let fixture = try JournalFixture()
+        var session = fixtureSession()
+        let audio = segment(intervalID: session.intervals[0].id, start: 0)
+        session.segments = [audio]
+        try fixture.seed(session)
+        let baseline = IncrementalSessionJournal(connection: fixture.connection)
+        try baseline.migrate()
+        try DictationHistoryRepository(connection: fixture.connection).migrate()
+        var running = session
+        running.jobs.append(ProcessingJob(stage: .transcription, status: .running,
+            inputIDs: [audio.id], totalUnits: 1))
+        running.updatedAt = Date()
+        let change = try IncrementalSessionJournal.TranscriptionChange.between(session, and: running)
+        let interrupted = IncrementalSessionJournal(connection: fixture.connection) { point in
+            switch (boundary, point) {
+            case (0, .appendAfterInsert), (1, .appendBeforeCommit): throw InjectedJournalFailure.interrupted
+            default: break
+            }
+        }
+        #expect(throws: InjectedJournalFailure.interrupted) {
+            try interrupted.append(sessionID: session.id, expectedRevision: 1,
+                segments: [], updatedAt: running.updatedAt, transcription: change)
+        }
+        #expect(try baseline.latestRevision(sessionID: session.id) == 1)
+        #expect(try baseline.deltas(sessionID: session.id, afterRevision: 1).isEmpty)
+        #expect(try baseline.history().first?.revision == 1)
+        #expect(try JSONDecoder().decode(VoiceSession.self, from: fixture.data("SELECT payload FROM sessions")) == session)
+        let delta = try baseline.append(sessionID: session.id, expectedRevision: 1,
+            segments: [], updatedAt: running.updatedAt, transcription: change)
+        try IncrementalSessionJournal.apply(delta, to: &session, afterRevision: 1)
+        #expect(session == running)
+    }
+
     @Test("Version 1 checkpoints migrate atomically without rewriting original session payloads")
     func legacyMigrationPreservesPayload() throws {
         let fixture = try JournalFixture()
@@ -223,6 +260,52 @@ struct IncrementalSessionJournalTests {
         #expect(found.count == 7 && Set(found) == expected)
         #expect(found.map(\.uuidString) == found.map(\.uuidString).sorted(by: >))
         #expect(throws: (any Error).self) { try journal.history(limit: 257) }
+    }
+
+
+    @Test("Reusable transcription replay validates complete deltas before publishing any mutation",
+          arguments: ["foreign", "duplicate", "correction", "stale"])
+    func replayIndexesRejectInvalidMutation(kind: String) throws {
+        var original = fixtureSession()
+        let audio = segment(intervalID: original.intervals[0].id, start: 0)
+        original.segments = [audio]
+        let job = ProcessingJob(stage: .transcription, status: .running, inputIDs: [audio.id], totalUnits: 1)
+        original.jobs = [job]
+        var completed = job
+        completed.status = .completed
+        completed.completedUnits = 1
+        let transcript = TranscriptRevision(rawText: "Preserve the original.",
+            text: "Preserve the original.", segmentIDs: [audio.id], startTime: 0, endTime: 5)
+        var invalid = IncrementalSessionJournal.TranscriptionChange(previousJob: job,
+            job: completed, transcripts: [transcript], corrections: [])
+        if kind == "foreign" {
+            var foreign = transcript
+            foreign.id = UUID()
+            foreign.segmentIDs = [UUID()]
+            invalid.transcripts.append(foreign)
+        }
+        if kind == "duplicate" { invalid.transcripts.append(transcript) }
+        if kind == "correction" {
+            invalid.corrections = [CorrectionPatch(originalRevisionID: UUID(),
+                correctedRevisionID: transcript.id, before: "x", after: transcript.text)]
+        }
+        if kind == "stale" { invalid.previousJob?.completedUnits = 1 }
+        var restored = original
+        var state = try IncrementalSessionJournal.TranscriptionReplayState(restored)
+        #expect(throws: (any Error).self) {
+            try state.apply(invalid, to: &restored, updatedAt: original.updatedAt)
+        }
+        #expect(restored == original)
+        let valid = IncrementalSessionJournal.TranscriptionChange(previousJob: job,
+            job: completed, transcripts: [transcript], corrections: [])
+        let date = original.updatedAt.addingTimeInterval(5)
+        try state.apply(valid, to: &restored, updatedAt: date)
+        #expect(restored.jobs == [completed])
+        #expect(restored.transcripts == [transcript])
+        #expect(restored.brief?.takes[0].transcriptIDs == [transcript.id])
+        #expect(restored.updatedAt == date)
+        #expect(throws: (any Error).self) { try state.apply(valid, to: &restored, updatedAt: date) }
+        #expect(restored.transcripts == [transcript])
     }
 
     @Test("Eight hours of five-second source metadata append without rewriting the full checkpoint",

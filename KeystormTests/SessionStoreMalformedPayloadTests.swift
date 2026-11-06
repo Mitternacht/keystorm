@@ -42,7 +42,7 @@ struct SessionStoreMalformedPayloadTests {
     }
 
     @Test("A rejected catalog copy without JSON fallback fails without deleting or rewriting it",
-          arguments: ["empty", "oversized", "text"])
+          .serialized, arguments: ["empty", "oversized", "text"])
     func missingFallbackPreservesRejectedCopy(kind: String) async throws {
         let fixture = try MalformedCatalogFixture()
         defer { fixture.remove() }
@@ -62,6 +62,8 @@ struct SessionStoreMalformedPayloadTests {
         #expect(try fixture.shape(session.id) == unchangedShape)
         #expect(try await reopened.containsSession(session.id))
         #expect(try await reopened.prepareLazyStartup().totalSessionCount == 1)
+        // The hosted runner can omit parameterized completion events; retain a per-case marker.
+        print("MALFORMED_CATALOG_RECOVERY_COMPLETED \(kind)")
     }
 
     @Test("A genuine catalog query failure cannot masquerade as a successful snapshot-only archive")
@@ -91,7 +93,7 @@ struct SessionStoreMalformedPayloadTests {
         let unchangedShape = try fixture.shape(old.id)
 
         let migrated = try SessionStore(root: fixture.root)
-        #expect(try fixture.integer("PRAGMA user_version") == 4)
+        #expect(try fixture.integer("PRAGMA user_version") == 5)
         #expect(try fixture.shape(old.id) == unchangedShape)
         let startup = try await migrated.prepareLazyStartup()
         #expect(startup.totalSessionCount == 2)
