@@ -11,6 +11,7 @@ struct DictationCleanFinishIntegrationTests {
     /// This test makes no microphone, ASR accuracy or real Accessibility claim.
     @Test("Installed Qwen Clean Finish persists the original and delivers only its committed output",
           .enabled(if: ProcessInfo.processInfo.environment["KEYSTORM_RUN_CLEAN_FINISH"] == "1"),
+          .exclusiveModelUse,
           .timeLimit(.minutes(5)))
     func installedQwenCleanFinishAndReopen() async throws {
         let models = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
@@ -25,7 +26,8 @@ struct DictationCleanFinishIntegrationTests {
                 .appendingPathComponent("Keystorm-CleanFinish-\(UUID().uuidString)", isDirectory: true)
             let store = try SessionStore(root: root)
             let transcript = TranscriptRevision(rawText: text, text: text, origin: .imported)
-            let source = DictationTextRevision(rawText: text, text: text, sourceTranscriptIDs: [transcript.id])
+            let source = DictationTextRevision(rawText: text, text: DictationFillerCleanup.apply(to: DictationSpokenFormatting.apply(to: text)),
+                                               sourceTranscriptIDs: [transcript.id])
             var seed = VoiceSession()
             seed.title = "Synthetic \(name) Clean Finish fixture"
             seed.transcripts = [transcript]
@@ -70,8 +72,9 @@ struct DictationCleanFinishIntegrationTests {
                 #expect(saved.outputMode == .clean)
                 #expect(saved.activeOutputID == output.id)
                 #expect(saved.delivery?.state == .inserted)
-                #expect(history.count == 2)
-                #expect(history.first?.textRevision == source)
+                // The source differs from the raw transcript once fillers are removed, so the history may keep both.
+                #expect(history.count >= 2)
+                #expect(history.contains { $0.textRevision == source })
                 #expect(history.last?.textRevision == output)
                 #expect(output.rawText.utf8.elementsEqual(text.utf8))
                 #expect(output.sourceTranscriptIDs == [transcript.id])

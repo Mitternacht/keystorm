@@ -17,6 +17,180 @@ struct IncrementalSessionJournal {
         var revision: Int64
         var segments: [AudioSegment]
         var updatedAt: Date
+        var transcription: TranscriptionChange? = nil
+    }
+
+    /// Only the mutations produced by one speech job. Immutable source records stay
+    /// in the checkpoint/capture journal; this is not a general metadata patch.
+    struct TranscriptionChange: Codable, Equatable, Sendable {
+        var previousJob: ProcessingJob?
+        var job: ProcessingJob
+        var transcripts: [TranscriptRevision]
+        var corrections: [CorrectionPatch]
+
+        static func between(_ previous: VoiceSession, and next: VoiceSession) throws -> Self {
+            guard next.transcripts.starts(with: previous.transcripts),
+                  next.corrections.starts(with: previous.corrections) else {
+                throw KeystormError.message("Transcription cannot rewrite saved source text or corrections.")
+            }
+            let prior: ProcessingJob?
+            let job: ProcessingJob
+            if next.jobs.count == previous.jobs.count + 1, next.jobs.starts(with: previous.jobs),
+               let last = next.jobs.last {
+                prior = nil
+                job = last
+            } else {
+                guard next.jobs.count == previous.jobs.count else {
+                    throw KeystormError.message("Transcription must update exactly one job.")
+                }
+                let changed = next.jobs.indices.filter { next.jobs[$0] != previous.jobs[$0] }
+                guard changed.count == 1, let index = changed.first else {
+                    throw KeystormError.message("Transcription must update exactly one job.")
+                }
+                prior = previous.jobs[index]
+                job = next.jobs[index]
+            }
+            let change = Self(previousJob: prior, job: job,
+                transcripts: Array(next.transcripts.dropFirst(previous.transcripts.count)),
+                corrections: Array(next.corrections.dropFirst(previous.corrections.count)))
+            var applied = previous
+            try change.apply(to: &applied, updatedAt: next.updatedAt)
+            guard applied == next else {
+                throw KeystormError.message("The transcription checkpoint changed outside its job and output.")
+            }
+            return change
+        }
+
+        func apply(to session: inout VoiceSession, updatedAt: Date) throws {
+            var state = try TranscriptionReplayState(session)
+            var next = session
+            try state.apply(self, to: &next, updatedAt: updatedAt)
+            session = next
+        }
+    }
+
+    /// One set of indexes for an entire recovery tail. Rebuilding these sets and
+    /// copying the growing session for every speech result makes replay quadratic.
+    /// Callers discard their local recovery result on error; apply validates the
+    /// complete change before mutating either that result or its indexes.
+    struct TranscriptionReplayState {
+        private var sources: [UUID: AudioSegment]
+        private var jobIndices: [UUID: Int]
+        private var transcriptIDs: Set<UUID>
+        private var correctionIDs: Set<UUID>
+        private let configurationIDs: Set<UUID>
+        private var takeByInterval: [UUID: Int] = [:]
+        private var takeTranscriptIDs: [Set<UUID>] = []
+        private var derivedWorkInvalidated = false
+
+        init(_ session: VoiceSession) throws {
+            guard Set(session.segments.map(\.id)).count == session.segments.count,
+                  Set(session.jobs.map(\.id)).count == session.jobs.count,
+                  Set(session.transcripts.map(\.id)).count == session.transcripts.count,
+                  Set(session.corrections.map(\.id)).count == session.corrections.count else {
+                throw KeystormError.message("The transcription checkpoint contains duplicate record identities.")
+            }
+            sources = Dictionary(uniqueKeysWithValues: session.segments.map { ($0.id, $0) })
+            jobIndices = Dictionary(uniqueKeysWithValues: session.jobs.enumerated().map { ($0.element.id, $0.offset) })
+            transcriptIDs = Set(session.transcripts.map(\.id))
+            correctionIDs = Set(session.corrections.map(\.id))
+            configurationIDs = Set(session.configurations.map(\.id))
+            if let brief = session.brief {
+                takeTranscriptIDs = brief.takes.map { Set($0.transcriptIDs) }
+                for (index, take) in brief.takes.enumerated() where take.trashedAt == nil {
+                    for interval in take.activeIntervalIDs where takeByInterval[interval] == nil {
+                        takeByInterval[interval] = index
+                    }
+                }
+            }
+        }
+
+        mutating func appendSource(_ source: AudioSegment) throws {
+            guard sources.updateValue(source, forKey: source.id) == nil else {
+                throw KeystormError.message("The capture journal repeats an immutable source.")
+            }
+        }
+
+        mutating func invalidateDerivedWork(in session: inout VoiceSession) {
+            if !derivedWorkInvalidated {
+                session.invalidateDerivedWork()
+                derivedWorkInvalidated = true
+            }
+        }
+
+        mutating func apply(_ change: TranscriptionChange, to session: inout VoiceSession,
+                            updatedAt: Date) throws {
+            let job = change.job
+            guard job.stage == .transcription, job.inputIDs.count == 1,
+                  let sourceID = job.inputIDs.first, let source = sources[sourceID],
+                  job.createdAt.timeIntervalSinceReferenceDate.isFinite,
+                  updatedAt.timeIntervalSinceReferenceDate.isFinite,
+                  job.totalUnits == 1, (0...1).contains(job.completedUnits),
+                  job.configurationID == nil || configurationIDs.contains(job.configurationID!) else {
+                throw KeystormError.message("The transcription job does not own a saved audio source.")
+            }
+            let replacementIndex: Int?
+            if let previousJob = change.previousJob {
+                guard let index = jobIndices[previousJob.id],
+                      session.jobs[index] == previousJob, previousJob.id == job.id,
+                      previousJob.stage == job.stage, previousJob.inputIDs == job.inputIDs,
+                      previousJob.configurationID == job.configurationID,
+                      previousJob.createdAt == job.createdAt, previousJob.totalUnits == job.totalUnits else {
+                    throw KeystormError.message("The transcription job changed before its output was committed.")
+                }
+                replacementIndex = index
+            } else {
+                guard jobIndices[job.id] == nil, job.status == .running,
+                      change.transcripts.isEmpty, change.corrections.isEmpty else {
+                    throw KeystormError.message("A new transcription job must start without an output.")
+                }
+                replacementIndex = nil
+            }
+            var addedTranscriptIDs: Set<UUID> = []
+            for transcript in change.transcripts {
+                guard !transcriptIDs.contains(transcript.id),
+                      addedTranscriptIDs.insert(transcript.id).inserted,
+                      transcript.segmentIDs == [sourceID],
+                      transcript.createdAt.timeIntervalSinceReferenceDate.isFinite,
+                      transcript.startTime.isFinite, transcript.endTime.isFinite,
+                      transcript.endTime >= transcript.startTime,
+                      transcript.replacedRevisionIDs.allSatisfy({
+                          $0 != transcript.id && (transcriptIDs.contains($0) || addedTranscriptIDs.contains($0))
+                      }) else {
+                    throw KeystormError.message("The transcription output has invalid source ownership.")
+                }
+            }
+            var addedCorrectionIDs: Set<UUID> = []
+            for correction in change.corrections {
+                guard !correctionIDs.contains(correction.id),
+                      addedCorrectionIDs.insert(correction.id).inserted,
+                      transcriptIDs.contains(correction.originalRevisionID) ||
+                        addedTranscriptIDs.contains(correction.originalRevisionID),
+                      addedTranscriptIDs.contains(correction.correctedRevisionID),
+                      correction.createdAt.timeIntervalSinceReferenceDate.isFinite else {
+                    throw KeystormError.message("The transcription correction has invalid source ownership.")
+                }
+            }
+            if let index = replacementIndex {
+                session.jobs[index] = job
+            } else {
+                jobIndices[job.id] = session.jobs.count
+                session.jobs.append(job)
+            }
+            transcriptIDs.formUnion(addedTranscriptIDs)
+            correctionIDs.formUnion(addedCorrectionIDs)
+            session.transcripts.append(contentsOf: change.transcripts)
+            session.corrections.append(contentsOf: change.corrections)
+            if let output = change.transcripts.last {
+                if let index = takeByInterval[source.intervalID],
+                   takeTranscriptIDs[index].insert(output.id).inserted {
+                    session.brief?.takes[index].transcriptIDs.append(output.id)
+                }
+                session.brief?.reviewedRevisionID = nil
+                invalidateDerivedWork(in: &session)
+            }
+            session.updatedAt = updatedAt
+        }
     }
 
     struct HistoryCursor: Equatable, Sendable {
@@ -51,7 +225,7 @@ struct IncrementalSessionJournal {
     /// older applications must reject the catalog instead of ignoring its durable tail.
     func migrate() throws {
         let version = try integer("PRAGMA user_version") ?? 0
-        guard version == 1 || version == Int64(Self.catalogVersion) || version == 3 || version == Int64(DictationHistoryRepository.catalogVersion) else { throw failure("Unsupported catalog version.") }
+        guard version == 1 || version == Int64(Self.catalogVersion) || version == 3 || version == 4 || version == Int64(DictationHistoryRepository.catalogVersion) else { throw failure("Unsupported catalog version.") }
         guard version == 1 else {
             try execute("CREATE INDEX IF NOT EXISTS capture_source_end ON session_capture_sources(session_id, end_time, start_time)")
             return
@@ -109,10 +283,10 @@ struct IncrementalSessionJournal {
     /// Appends a small capture delta in one WAL/FULL transaction. Exact retries return
     /// the existing delta. A changed source, stale revision or overlap fails closed.
     func append(sessionID: UUID, expectedRevision: Int64, segments: [AudioSegment],
-                updatedAt: Date) throws -> CaptureDelta {
+                updatedAt: Date, transcription: TranscriptionChange? = nil) throws -> CaptureDelta {
         guard expectedRevision > 0, expectedRevision < Int64.max else { throw failure("Invalid capture revision.") }
-        let delta = CaptureDelta(sessionID: sessionID, revision: expectedRevision + 1,
-            segments: segments.sorted { $0.startTime < $1.startTime }, updatedAt: updatedAt)
+        let delta = CaptureDelta(version: transcription == nil ? 1 : 2, sessionID: sessionID, revision: expectedRevision + 1,
+            segments: segments.sorted { $0.startTime < $1.startTime }, updatedAt: updatedAt, transcription: transcription)
         try validate(delta)
         let payload = try encoded(delta)
         guard payload.count <= Self.maximumDeltaBytes else { throw failure("Capture delta exceeds its metadata bound.") }
@@ -231,12 +405,18 @@ struct IncrementalSessionJournal {
     }
 
     static func apply(_ delta: CaptureDelta, to session: inout VoiceSession, afterRevision: Int64) throws {
-        guard delta.version == 1, delta.sessionID == session.id, afterRevision < Int64.max,
+        guard (delta.version == 1 || delta.version == 2), delta.sessionID == session.id, afterRevision < Int64.max,
               delta.revision == afterRevision + 1,
-              !delta.segments.isEmpty, delta.segments.count <= maximumSegmentsPerDelta,
+              (delta.transcription == nil ? !delta.segments.isEmpty : delta.segments.isEmpty), delta.segments.count <= maximumSegmentsPerDelta,
               delta.updatedAt.timeIntervalSinceReferenceDate.isFinite else {
             throw KeystormError.message("Capture journal cannot be folded over this checkpoint.")
         }
+        if let change = delta.transcription {
+            guard delta.version == 2 else { throw KeystormError.message("Unsupported transcription delta.") }
+            try change.apply(to: &session, updatedAt: delta.updatedAt)
+            return
+        }
+        guard delta.version == 1 else { throw KeystormError.message("Missing transcription delta.") }
         let known = Set(session.segments.map(\.id))
         let intervals = Set(session.intervals.map(\.id))
         guard Set(delta.segments.map(\.id)).count == delta.segments.count,
@@ -330,9 +510,10 @@ struct IncrementalSessionJournal {
     }
 
     private func validate(_ delta: CaptureDelta) throws {
-        guard delta.version == 1, delta.revision > 1,
+        guard delta.revision > 1,
               delta.updatedAt.timeIntervalSinceReferenceDate.isFinite,
-              (1...Self.maximumSegmentsPerDelta).contains(delta.segments.count),
+              ((delta.version == 1 && delta.transcription == nil && (1...Self.maximumSegmentsPerDelta).contains(delta.segments.count)) ||
+               (delta.version == 2 && delta.transcription != nil && delta.segments.isEmpty)),
               Set(delta.segments.map(\.id)).count == delta.segments.count else { throw failure("Invalid bounded capture delta.") }
         for segment in delta.segments { try validate(segment) }
     }

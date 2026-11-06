@@ -23,10 +23,27 @@ struct KeystormSettings: View {
     }
 }
 
+extension View {
+    /// Footnote-sized secondary text for the explanation under a setting. It wraps instead of truncating and,
+    /// inside a grouped Form, sits close to the control above it. Text styles only, so Dynamic Type works.
+    func settingsNote() -> some View {
+        font(.footnote)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+            .listRowSeparator(.hidden, edges: .top)
+    }
+}
+
 /// Delivery preferences are snapshotted when a recording starts. Blocked apps and websites are read again at
 /// Finish, so blocking one during a recording still prevents writing to it.
 struct DictationDeliverySettingsView: View {
     @Bindable var preferences: DictationPreferences
+    @AppStorage(DictationRetention.storageKey) private var retentionRaw = DictationRetention.forever.rawValue
+
+    private var retention: Binding<DictationRetention> {
+        Binding(get: { DictationRetention(rawValue: retentionRaw) ?? .forever },
+                set: { retentionRaw = $0.rawValue })
+    }
 
     var body: some View {
         Form {
@@ -35,10 +52,40 @@ struct DictationDeliverySettingsView: View {
                     .accessibilityHint("Pastes finished dictation into the text field where you started recording.")
                     .accessibilityIdentifier("dictation.pasteIntoOtherApps")
                 Text("Paste the finished text into the field you started in. Known terminal apps, recognized terminals inside editors, and password fields are never pasted into. After a confirmed paste your previous clipboard is restored; if a paste can't be confirmed, the result stays on the clipboard instead.")
-                    .font(.callout).foregroundStyle(.secondary)
-                Text("TextEdit uses verified insertion instead. Other apps can't report what they inserted, so check the result. When this is off, or a field can't be checked, the result stays in Keystorm to copy. Changes apply to the next recording.")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .settingsNote()
+                Text("TextEdit uses verified insertion instead. Other apps can't report what they inserted, so check the result. When this is off, or a field can't be checked, the result stays in Keystorm. Changes apply to the next recording.")
+                    .settingsNote()
+                Toggle("Copy when not inserted", isOn: $preferences.copyWhenNotInserted)
+                    .accessibilityHint("Copies finished dictation to the clipboard when it wasn't inserted or pasted.")
+                    .accessibilityIdentifier("dictation.copyWhenNotInserted")
+                Text("When the finished text can't be inserted or pasted, it goes on the clipboard so you can paste it yourself.")
+                    .settingsNote()
+                Toggle("Spoken punctuation commands", isOn: $preferences.spokenFormattingCommands)
+                    .accessibilityHint("Turns spoken words like comma, new line and Absatz into punctuation and line breaks.")
+                    .accessibilityIdentifier("dictation.spokenFormattingCommands")
+                Text("Say “comma”, “new line” or “Absatz” and Keystorm writes the symbol. Words that are plainly part of a sentence stay as they are.")
+                    .settingsNote()
             } header: { Text("Delivery") }
+            Section {
+                Picker("Keep speech and text models loaded", selection: $preferences.keepModelLoaded) {
+                    ForEach(ModelResidencyPolicy.allCases) { policy in
+                        Text(policy.title).tag(policy)
+                    }
+                }
+                .accessibilityIdentifier("dictation.keepModelLoaded")
+            } header: { Text("Speed") } footer: {
+                Text(preferences.keepModelLoaded.detail)
+            }
+            Section {
+                Picker("Keep dictation history", selection: retention) {
+                    ForEach(DictationRetention.allCases) { choice in
+                        Text(choice.title).tag(choice)
+                    }
+                }
+                .accessibilityIdentifier("dictation.historyRetention")
+            } header: { Text("History") } footer: {
+                Text("Applied at launch and after each dictation. Dictations still being recorded are never deleted.")
+            }
             Section {
                 // Verbatim never runs a text model; the speech model's own number style reaches the field as is.
                 Text("In Verbatim, numbers stay as the speech model writes them. The model can write spoken numbers as digits: “fünf” becomes “5”.")
@@ -49,9 +96,15 @@ struct DictationDeliverySettingsView: View {
             DictationBlockedWebsitesSection(preferences: preferences)
             if preferences.hasUnreadableExclusions {
                 Section {
-                    Label("Some saved blocked apps, websites or presets couldn't be read and are ignored. They stay saved until you change that list.",
-                          systemImage: "exclamationmark.triangle")
-                        .font(.callout)
+                    Label {
+                        Text("Some saved blocked apps, websites or presets couldn't be read and are ignored. They stay saved until you change that list.")
+                            .fixedSize(horizontal: false, vertical: true)
+                    } icon: {
+                        // Orange symbol; the sentence stays at label color for contrast.
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                    }
+                    .font(.callout)
                 }
             }
         }
@@ -85,9 +138,7 @@ struct BriefPerformanceView: View {
                     isExpanded: $showRecentMeasurements
                 )
                 Text("Up to 128 samples per stage. Reports include hardware, models, timings, and memory, and exclude recordings and brief text.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                    .settingsNote()
             }
             .padding(24)
         }
@@ -194,7 +245,7 @@ private struct RuntimeMemoryMeasurements: View {
             }
             if measurements["workerMemoryIsCached"] == 1 {
                 Text("Memory shows the latest snapshot while processing.")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .settingsNote()
             }
         }
     }

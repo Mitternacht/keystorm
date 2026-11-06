@@ -67,9 +67,13 @@ final class WorkspaceModel {
     private(set) var historyMaintenanceAvailable = false
     private(set) var isCheckingHistory = false
     private(set) var historyPendingRepairCount = 0
+    /// True while a delete or retention pass removes saved dictations; the history list is disabled meanwhile.
+    private(set) var isDeletingDictationHistory = false
     @ObservationIgnored private var historyCursor: DictationHistoryCursor?
     @ObservationIgnored private var historyPageToken = UUID()
     @ObservationIgnored private var historyRefreshTask: Task<Void, Never>?
+    /// The newest `refreshDictationHistory` run, so overlapping callers can wait for the one that wins.
+    @ObservationIgnored private var historyRefreshRun: Task<Void, Never>?
     @ObservationIgnored private var historySelectionTask: Task<DictationSessionHydration, Error>?
     @ObservationIgnored private var historySelectionToken: UUID?
     @ObservationIgnored private var historyMaintenanceCursor: String?
@@ -126,16 +130,111 @@ final class WorkspaceModel {
     @ObservationIgnored private let storageRoot: URL?
     @ObservationIgnored private(set) var store: SessionStore?
     @ObservationIgnored private var inference: InferenceWorkerClient?
-    private let capture = AudioCapture()
+    private let capture: AudioCapture
     @ObservationIgnored private var player: AVAudioPlayer?
     @ObservationIgnored private var workTask: Task<Void, Never>?
     @ObservationIgnored private var workToken: UUID?
+    @ObservationIgnored private var workSessionID: UUID?
     @ObservationIgnored private var workKind: WorkspaceWorkKind = .general
     @ObservationIgnored private var textPrewarm: TextPrewarmController?
     /// Set by a dictation Start or Resume just before capture begins, then consumed by it.
     @ObservationIgnored private var pendingCaptureQuickMode: DictationQuickMode?
     @ObservationIgnored private var commitTail: Task<Void, Never>?
     @ObservationIgnored private var persistenceTail: Task<Void, Error>?
+    @ObservationIgnored private var captureFailureTask: Task<Void, Never>?
+    /// Source files remain on disk when metadata capacity rejects their acknowledgement.
+    /// Queued snapshots must not accidentally publish those source records afterward.
+    @ObservationIgnored private var rejectedCaptureSegmentIDs: [UUID: Set<UUID>] = [:]
+    private struct RejectedTranscription {
+        struct JobChange: Equatable {
+            var attempted: ProcessingJob
+            var previous: ProcessingJob?
+        }
+        var transcriptIDs: Set<UUID> = []
+        var correctionIDs: Set<UUID> = []
+        var jobChanges: [JobChange] = []
+
+        init() {}
+
+        init(before: VoiceSession, after: VoiceSession) {
+            transcriptIDs = Set(after.transcripts.map(\.id)).subtracting(before.transcripts.map(\.id))
+            correctionIDs = Set(after.corrections.map(\.id)).subtracting(before.corrections.map(\.id))
+            let previousJobs = Dictionary(before.jobs.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            jobChanges = after.jobs.compactMap { job in
+                let previous = previousJobs[job.id]
+                return previous == job ? nil : JobChange(attempted: job, previous: previous)
+            }
+        }
+    }
+    @ObservationIgnored private var rejectedTranscriptions: [UUID: RejectedTranscription] = [:]
+
+    /// The same bounded, idempotent capture bookkeeping applies to a pending draft
+    /// and, only after capacity rejection, to its last acknowledged checkpoint.
+    private struct CaptureClosure {
+        let intervalIDs: Set<UUID>
+        let takeIDs: Set<UUID>
+        let endedAt: Date
+        let hostTime: UInt64?
+        let status: SessionStatus?
+        let gap: SessionGap?
+
+        init(session: VoiceSession, intervalID: UUID? = nil, status: SessionStatus?,
+             hostTime: UInt64?, failure: String? = nil) {
+            let endedAt = Date()
+            self.endedAt = endedAt
+            intervalIDs = Set(session.intervals.filter {
+                $0.endedAt == nil && (intervalID == nil || $0.id == intervalID)
+            }.map(\.id))
+            takeIDs = Set((session.brief?.takes ?? []).filter { take in
+                status != nil && take.status == .recording &&
+                    (intervalID.map { take.captureIntervalIDs.contains($0) } ?? true)
+            }.map(\.id))
+            self.hostTime = hostTime
+            self.status = status
+            gap = failure.map { reason in
+                session.gaps.first { $0.reason == reason } ?? SessionGap(startedAt: endedAt, reason: reason)
+            }
+        }
+
+        func apply(to session: inout VoiceSession, usingReservedCapacity: Bool = false) {
+            if let status { session.status = status }
+            for index in session.intervals.indices where intervalIDs.contains(session.intervals[index].id) &&
+                session.intervals[index].endedAt == nil {
+                session.intervals[index].endedAt = endedAt
+                if let hostTime { session.intervals[index].hostTime = hostTime }
+            }
+            if var gap {
+                let originalReason = gap.reason
+                if usingReservedCapacity {
+                    // This fixed ASCII detail plus UUID/date/keys fits the reserved
+                    // base allowance. The pending draft and UI retain the full cause.
+                    gap.reason = "Recording stopped; original audio is retained. Pending edits remain unsaved."
+                }
+                if !session.gaps.contains(where: {
+                    $0.id == gap.id || $0.reason == originalReason
+                }) {
+                    session.gaps.append(gap)
+                }
+            }
+            if var brief = session.brief {
+                for index in brief.takes.indices where takeIDs.contains(brief.takes[index].id) &&
+                    brief.takes[index].status == .recording {
+                    brief.takes[index].status = .paused
+                    if let metadataIndex = session.dictation?.recordings.firstIndex(where: { $0.id == brief.takes[index].id }) {
+                        session.dictation?.recordings[metadataIndex].state = .paused
+                        session.dictation?.recordings[metadataIndex].updatedAt = endedAt
+                        session.dictation?.recordings[metadataIndex].failureMessage = nil
+                    }
+                }
+                if gap != nil { brief.reviewedRevisionID = nil }
+                session.brief = brief
+            }
+            session.updatedAt = endedAt
+        }
+    }
+    /// Sessions being deleted or already deleted in this process. A save that was queued before the delete
+    /// and runs after it would write the session back, so durable saves skip these ids.
+    @ObservationIgnored private var deletedDictationSessionIDs = Set<UUID>()
     @ObservationIgnored private var dictionaryTail: Task<Void, Error>?
     @ObservationIgnored private var recordingSessionID: UUID?
     @ObservationIgnored private var recordingStartTime: Double = 0
@@ -144,6 +243,9 @@ final class WorkspaceModel {
     @ObservationIgnored private var speechPhaseReady = true
     @ObservationIgnored private var livePreviewTask: Task<Void, Never>?
     @ObservationIgnored private var progressiveTranscriptionRequested = false
+    /// What each recently transcribed segment heard just past its right edge, so the next segment can recover a word
+    /// both windows left to the other. Memory only: a miss means the word is simply not recovered.
+    @ObservationIgnored private var seamTails: [UUID: SeamTail] = [:]
     @ObservationIgnored private var phaseTeardownTail: Task<Void, Never>?
     @ObservationIgnored private var installTokens: [String: UUID] = [:]
     @ObservationIgnored private var captureMailbox: CommittedAudioMailbox?
@@ -151,6 +253,9 @@ final class WorkspaceModel {
     private var changingCapture = false
     @ObservationIgnored private var changingSession = false
     private var captureStartInProgress = false
+    /// Why the microphone stopped on its own without losing audio (route change, sleep, stall). Read by
+    /// `dictationCaptureStatus` so a dictation keeps its destination and can still resume or finish; cleared on resume.
+    private var captureSuspension: (sessionID: UUID, reason: String)?
     @ObservationIgnored private var captureStartWaiters: [CheckedContinuation<Void, Never>] = []
     @ObservationIgnored private var capturePauseTask: Task<Void, Never>?
     @ObservationIgnored private var terminating = false
@@ -187,10 +292,12 @@ final class WorkspaceModel {
     @ObservationIgnored private let modelDirectoryOverride: URL?
     @ObservationIgnored private let textPrewarmLoader: TextPrewarmController.Prewarm?
     /// `textPrewarmLoader` replaces the installed-model warm-up, so tests can use a fake.
-    init(root: URL? = nil, modelDirectory: URL? = nil, textPrewarmLoader: TextPrewarmController.Prewarm? = nil) {
+    init(root: URL? = nil, modelDirectory: URL? = nil, textPrewarmLoader: TextPrewarmController.Prewarm? = nil,
+         capture: AudioCapture? = nil) {
         storageRoot = root
         modelDirectoryOverride = modelDirectory
         self.textPrewarmLoader = textPrewarmLoader
+        self.capture = capture ?? AudioCapture()
     }
 
     /// Default startup reads indexed headers only; full loading is explicit legacy maintenance.
@@ -316,7 +423,21 @@ final class WorkspaceModel {
         await refreshDictationHistory()
     }
 
+    /// Reloads the first pages of History. When a newer refresh starts while this one is in flight, the newer one
+    /// supplies the entries and this call waits for it too, so the list is current when the call returns (a delete
+    /// returns only after its sessions have left the list).
     func refreshDictationHistory() async {
+        let run = Task<Void, Never> { @MainActor [weak self] in await self?.performHistoryRefresh() }
+        historyRefreshRun = run
+        var joined = run
+        await run.value
+        while let latest = historyRefreshRun, latest != joined {
+            joined = latest
+            await latest.value
+        }
+    }
+
+    private func performHistoryRefresh() async {
         guard let store, !terminating else { return }
         let token = UUID()
         historyPageToken = token
@@ -477,7 +598,7 @@ final class WorkspaceModel {
         guard !legacyLibraryLoaded, !isEditingRecording, !changingSession else { return }
         var pinned = dirtyBriefSessionIDs
         for value in [selectedSessionID, recordingSessionID, id] { if let value { pinned.insert(value) } }
-        if workTask != nil, let selectedSessionID { pinned.insert(selectedSessionID) }
+        if let workSessionID { pinned.insert(workSessionID) }
         let recent = hydratedUseOrder.reversed().filter { !pinned.contains($0) }.prefix(max(0, 2 - pinned.count))
         let retained = pinned.union(recent)
         sessions.removeAll { !retained.contains($0.id) }
@@ -485,18 +606,32 @@ final class WorkspaceModel {
     }
 
     func newSession() async {
+        await createSession(persistImmediately: true, configure: nil)
+    }
+
+    /// `persistImmediately: false` keeps the new session in memory until its first durable
+    /// change. Only a caller whose very next step is a durable save may use it (dictation Start
+    /// saves before the microphone opens), so nothing worth recovering can exist unsaved.
+    private func createSession(persistImmediately: Bool, preserveModelWork: Bool = false,
+                               configure: ((inout VoiceSession) -> Void)?) async {
         cancelHistorySelection()
         guard let store, !terminating, !isCaptureTransitioning, !changingSession else { return }
         changingSession = true
         defer { changingSession = false; pruneHydratedSessions() }
         if isRecording { await pauseRecording() }
         await flushBriefEdits()
-        await cancelProcessing()
+        if preserveModelWork {
+            // Capture owns a separate lane. Cancellation may drain after the microphone starts.
+            if workKind == .general { workTask?.cancel() }
+        } else {
+            await cancelProcessing()
+        }
         var session = VoiceSession()
         session.brief = BriefDocument()
         session.title = Date().formatted(date: .abbreviated, time: .shortened)
+        configure?(&session)
         do {
-            try await store.save(session)
+            if persistImmediately { try await store.save(session) }
             sessions.insert(session, at: 0)
             selectedSessionID = session.id
             hydratedUseOrder.append(session.id)
@@ -567,6 +702,19 @@ final class WorkspaceModel {
         return session.segments.lazy.filter { intervals.contains($0.intervalID) }.reduce(0) { $0 + $1.duration }
     }
 
+    /// Dictation metadata for a take that is just starting. It rides in the same durable save as
+    /// the interval, so Start does not need separate saves for the mode and the Recording state.
+    static func recordDictationStart(in session: inout VoiceSession, takeID: UUID, mode: DictationQuickMode) throws {
+        session.materializeDictationMetadata()
+        guard let index = session.dictation?.recordings.firstIndex(where: { $0.id == takeID }) else {
+            throw KeystormError.message("The recording mode could not be saved.")
+        }
+        session.dictation?.recordings[index].captureMode = mode
+        session.dictation?.recordings[index].state = .recording
+        session.dictation?.recordings[index].failureMessage = nil
+        session.dictation?.recordings[index].updatedAt = Date()
+    }
+
     /// One durable transition owns each microphone interval. Selection changes cannot retarget a paused take.
     @discardableResult
     static func beginCaptureInterval(in session: inout VoiceSession, resuming takeID: UUID?, intervalID: UUID,
@@ -599,6 +747,20 @@ final class WorkspaceModel {
         return take
     }
 
+    private func persistCaptureStart(sessionID: UUID, resuming takeID: UUID?, intervalID: UUID,
+                                     finishMode: DictationQuickMode?) async throws -> BriefTake {
+        var take: BriefTake?
+        try await mutate(sessionID) { session in
+            take = try Self.beginCaptureInterval(in: &session, resuming: takeID, intervalID: intervalID,
+                intent: self.captureIntent, targetSection: self.selectedSectionKind, selectedBlockIDs: self.selectedBlockIDs)
+            if let finishMode, takeID == nil, let take {
+                try Self.recordDictationStart(in: &session, takeID: take.id, mode: finishMode)
+            }
+        }
+        guard let take else { throw KeystormError.message("The recording interval was not prepared.") }
+        return take
+    }
+
     private func startCapture(resuming takeID: UUID?) async {
         // Only a dictation Start or Resume names its Finish mode. Consume it before any early return.
         let finishMode = pendingCaptureQuickMode
@@ -626,13 +788,16 @@ final class WorkspaceModel {
             textModelInstalled: installedModelIDs.contains(ModelCatalog.primaryText.id))
         speechPhaseReady = false
         let previousWork = workTask
-        previousWork?.cancel()
+        // Short speech work and a text prewarm already in flight finish instead of being
+        // cancelled: cancelling a request ends the worker and both resident models, and the
+        // next dictation would start cold. The live loop waits on `teardown` below.
+        if workKind == .general { previousWork?.cancel() }
         let previousTeardown = phaseTeardownTail
         let teardown = Task {
             await previousTeardown?.value
             await previousWork?.value
-            if previousWork != nil { await inference.releaseText() }
-            else { await inference.finishTextJob() }
+            // A request cancelled in flight has already ended the worker; otherwise it keeps its lease.
+            await inference.finishTextJob()
         }
         phaseTeardownTail = teardown
         changingCapture = true
@@ -655,11 +820,15 @@ final class WorkspaceModel {
         recordingSessionID = id
         recordingStartTime = snapshot.recordedDuration
         do {
-            // Persist the logical session before the microphone can produce any audio.
-            try await mutate(id) { session in
-                startedTake = try Self.beginCaptureInterval(in: &session, resuming: takeID, intervalID: intervalID,
-                    intent: self.captureIntent, targetSection: self.selectedSectionKind, selectedBlockIDs: self.selectedBlockIDs)
-            }
+            // Persist the logical session before the microphone can produce any audio. A new
+            // dictation take also records its Finish mode and Recording state in this same save.
+            // Dictation Start used to make three more durable saves for that (an empty session, its
+            // dictation metadata, then the mode and state), each with two fsyncs and a FULL SQLite
+            // commit, before and after the microphone opened. Nothing is weakened: no audio exists
+            // until after this save, so an interruption before it leaves nothing to recover, and
+            // the one save after the microphone opens still follows it.
+            startedTake = try await persistCaptureStart(sessionID: id, resuming: takeID,
+                                                        intervalID: intervalID, finishMode: finishMode)
             guard let take = startedTake, !terminating else { throw CancellationError() }
             let directory = try await store.audioDirectory(id)
             guard !terminating else { throw CancellationError() }
@@ -671,6 +840,8 @@ final class WorkspaceModel {
                     Task { @MainActor in reference.value?.enqueueCommits(mailbox, sessionID: id) }
                 }, onFailure: { [reference] message in
                     Task { @MainActor in await reference.value?.captureFailed(message, sessionID: id, intervalID: intervalID, epoch: epoch) }
+                }, onInterruption: { [reference] interruption in
+                    Task { @MainActor in await reference.value?.captureInterrupted(interruption, sessionID: id, epoch: epoch) }
                 })
             guard !terminating else {
                 try await capture.pause()
@@ -709,16 +880,11 @@ final class WorkspaceModel {
             self.error = error.localizedDescription
             if capture.isRecording { try? await capture.pause() }
             await flushCommits(mailbox, sessionID: id)
-            try? await mutate(id) { session in
-                session.status = .interrupted
-                if let index = session.intervals.firstIndex(where: { $0.id == intervalID }) { session.intervals[index].endedAt = Date() }
-                session.gaps.append(SessionGap(reason: "Recording could not continue: \(error.localizedDescription)"))
-                if var brief = session.brief {
-                    for index in brief.takes.indices where brief.takes[index].captureIntervalIDs.contains(intervalID) {
-                        brief.takes[index].status = .paused
-                    }
-                    session.brief = brief
-                }
+            if let pending = session(id) {
+                let closure = CaptureClosure(session: pending, intervalID: intervalID,
+                    status: .interrupted, hostTime: nil,
+                    failure: "Recording could not continue: \(error.localizedDescription)")
+                try? await mutate(id, captureClosure: closure) { closure.apply(to: &$0) }
             }
             recordingSessionID = nil
             captureMailbox = nil
@@ -770,29 +936,12 @@ final class WorkspaceModel {
             recordingHUDSnapshot = recordingHUDSession?.snapshot
         }
         do {
-            try await mutate(id) { session in
-                session.status = failure == nil ? .paused : .interrupted
-                for index in session.intervals.indices where session.intervals[index].endedAt == nil {
-                    session.intervals[index].endedAt = Date()
-                    session.intervals[index].hostTime = self.capture.hostTime
-                }
-                if let failure { session.gaps.append(SessionGap(reason: failure)) }
-            }
-        } catch { self.error = error.localizedDescription }
+            let closure = CaptureClosure(session: try requireSession(id),
+                status: failure == nil ? .paused : .interrupted, hostTime: capture.hostTime, failure: failure)
+            try await mutate(id, captureClosure: closure) { closure.apply(to: &$0) }
+        } catch { self.error = "Recording paused. Pending edits remain unsaved: \(error.localizedDescription)" }
         recordingSessionID = nil
         captureMailbox = nil
-        do {
-            try await mutate(id) { session in
-                guard var brief = session.brief else { return }
-                for index in brief.takes.indices where brief.takes[index].status == .recording {
-                    brief.takes[index].status = .paused
-                    if let metadataIndex = session.dictation?.recordings.firstIndex(where: { $0.id == brief.takes[index].id }) {
-                        session.dictation?.recordings[metadataIndex].state = .paused
-                    }
-                }
-                session.brief = brief
-            }
-        } catch { self.error = error.localizedDescription }
         // Tail transcription starts after the recorder has drained. Preparing an edit remains deliberate.
         if installedModelIDs.contains(selectedSpeechModelID) {
             let previousWork = workTask
@@ -817,21 +966,15 @@ final class WorkspaceModel {
         // Late callbacks retain the old gap, without changing a newly resumed recording.
         let currentCapture = epoch == nil || captureEpoch == epoch
         error = message
-        if let index = sessions.firstIndex(where: { $0.id == id }) {
-            if currentCapture { sessions[index].status = .interrupted }
-            if !sessions[index].gaps.contains(where: { $0.reason == message }) { sessions[index].gaps.append(SessionGap(reason: message)) }
-            if var brief = sessions[index].brief {
-                for takeIndex in brief.takes.indices where currentCapture && brief.takes[takeIndex].status == .recording &&
-                    (intervalID.map { brief.takes[takeIndex].captureIntervalIDs.contains($0) } ?? true) {
-                    brief.takes[takeIndex].status = .paused
-                }
-                brief.reviewedRevisionID = nil
-                sessions[index].brief = brief
-            }
-            for interval in sessions[index].intervals.indices where sessions[index].intervals[interval].endedAt == nil && (intervalID == nil || sessions[index].intervals[interval].id == intervalID) {
-                sessions[index].intervals[interval].endedAt = Date()
-                if currentCapture, recordingSessionID == id { sessions[index].intervals[interval].hostTime = capture.hostTime }
-            }
+        let closure = session(id).map {
+            CaptureClosure(session: $0, intervalID: intervalID,
+                status: currentCapture ? .interrupted : nil,
+                hostTime: currentCapture && recordingSessionID == id ? capture.hostTime : nil,
+                failure: message)
+        }
+        if let closure, let index = sessions.firstIndex(where: { $0.id == id }) {
+            closure.apply(to: &sessions[index])
+            dirtyBriefSessionIDs.insert(id)
         }
         if currentCapture, let mailbox = captureMailbox, recordingSessionID == id { await flushCommits(mailbox, sessionID: id) }
         if currentCapture, recordingSessionID == id {
@@ -839,7 +982,7 @@ final class WorkspaceModel {
             livePreviewTask?.cancel(); livePreviewTask = nil
             recordingSessionID = nil; captureMailbox = nil; captureEpoch = nil; speechPhaseReady = false
         }
-        do { try await persist(id) } catch { self.error = "\(message) \(error.localizedDescription)" }
+        do { try await persist(id, captureClosure: closure) } catch { self.error = "\(message) Pending edits remain unsaved: \(error.localizedDescription)" }
         if currentCapture, recordingHUDSession?.sessionID == id,
            intervalID == nil || recordingHUDSession?.intervalID == intervalID {
             recordingHUDSession?.pause()
@@ -847,6 +990,17 @@ final class WorkspaceModel {
             recordingHUDSnapshot = recordingHUDSession?.snapshot
         }
         if currentCapture, workTask == nil { activity = "Recording interrupted" }
+    }
+
+    /// A stop that lost no audio: a route change, sleep or stall. The capture layer already drained the writer, so
+    /// this pauses the take exactly as Pause does. No gap is recorded, so Resume (on the then-current input) and
+    /// Finish both keep working, and a dictation reads it back as suspended so it keeps its destination.
+    private func captureInterrupted(_ interruption: CaptureInterruption, sessionID id: UUID, epoch: UUID) async {
+        // A pause the user already made, or a newer recording, owns the take by now.
+        guard captureEpoch == epoch, recordingSessionID == id, !changingCapture else { return }
+        captureSuspension = (id, interruption.message)
+        if session(id)?.dictation == nil { recoveryMessages.append(interruption.message) }
+        await pauseRecording()
     }
 
     private func enqueueCommits(_ mailbox: CommittedAudioMailbox, sessionID id: UUID) {
@@ -879,10 +1033,17 @@ final class WorkspaceModel {
                 let previousWrite = self.persistenceTail
                 let append = Task {
                     _ = try? await previousWrite?.value
-                    for offset in stride(from: 0, to: segments.count, by: IncrementalSessionJournal.maximumSegmentsPerDelta) {
-                        let end = min(segments.count, offset + IncrementalSessionJournal.maximumSegmentsPerDelta)
-                        _ = try await store.appendCapturedSegments(sessionID: id,
-                            segments: Array(segments[offset..<end]), updatedAt: updatedAt)
+                    do {
+                        for offset in stride(from: 0, to: segments.count, by: IncrementalSessionJournal.maximumSegmentsPerDelta) {
+                            let end = min(segments.count, offset + IncrementalSessionJournal.maximumSegmentsPerDelta)
+                            _ = try await store.appendCapturedSegments(sessionID: id,
+                                segments: Array(segments[offset..<end]), updatedAt: updatedAt)
+                        }
+                    } catch let failure as SessionMetadataCapacityError {
+                        // Reconcile before releasing this persistence task: later full saves
+                        // may already be queued with the speculative source records.
+                        try await self.retainAcknowledgedCapture(segments, sessionID: id, store: store)
+                        throw failure
                     }
                 }
                 self.persistenceTail = append
@@ -898,9 +1059,39 @@ final class WorkspaceModel {
                 self.error = "Committed audio is retained on disk, but catalog persistence failed: \(error.localizedDescription)"
                 if self.capture.isRecording { try? await self.capture.pause() }
                 let message = self.error ?? "Catalog persistence failed."
-                Task { @MainActor [weak self] in await self?.captureFailed(message, sessionID: id) }
+                let priorFailure = self.captureFailureTask
+                self.captureFailureTask = Task { @MainActor [weak self] in
+                    await priorFailure?.value
+                    await self?.captureFailed(message, sessionID: id)
+                }
             }
         }
+    }
+
+    private func retainAcknowledgedCapture(_ attempted: [AudioSegment], sessionID id: UUID,
+                                           store: SessionStore) async throws {
+        guard let durable = try await store.loadSession(id) else {
+            throw KeystormError.message("The last acknowledged recording checkpoint is unavailable. Original audio and sidecars are retained.")
+        }
+        let acknowledged = Set(durable.segments.map(\.id))
+        let rejected = Set(attempted.map(\.id)).subtracting(acknowledged)
+        rejectedCaptureSegmentIDs[id, default: []].formUnion(rejected)
+        if let index = sessions.firstIndex(where: { $0.id == id }) {
+            // Preserve all unrelated edits and every source accepted by an earlier batch.
+            sessions[index] = try Self.excludingUnacknowledgedCapture(rejected, from: sessions[index])
+        }
+    }
+
+    static func excludingUnacknowledgedCapture(_ rejected: Set<UUID>,
+                                               from snapshot: VoiceSession) throws -> VoiceSession {
+        guard !rejected.isEmpty else { return snapshot }
+        guard snapshot.transcripts.allSatisfy({ rejected.isDisjoint(with: $0.segmentIDs) }),
+              snapshot.jobs.allSatisfy({ rejected.isDisjoint(with: $0.inputIDs) }) else {
+            throw KeystormError.message("Pending transcription refers to audio whose metadata could not be acknowledged. Original audio and sidecars are retained; export before retrying.")
+        }
+        var result = snapshot
+        result.segments.removeAll { rejected.contains($0.id) }
+        return result
     }
 
     private func flushCommits(_ mailbox: CommittedAudioMailbox, sessionID id: UUID) async {
@@ -927,6 +1118,8 @@ final class WorkspaceModel {
             var receivedFirstText = false
             var previousDiscontinuities: Int64 = 0
             var retryAfter = ContinuousClock.now
+            var lastPreviewDecode: Duration = .zero
+            var incrementalPreview = IncrementalPreviewTranscript()
             // Load concurrently with capture, before the first durable segment exists.
             if !Task.isCancelled, self.liveCaptureMatches(id, intervalID: intervalID, epoch: epoch), self.workTask == nil {
                 await self.performLiveWork("Preparing live transcription", clearsError: false) {
@@ -962,7 +1155,12 @@ final class WorkspaceModel {
                     await self.performLiveWork("Updating live transcript", clearsError: false) {
                         do {
                             let started = ContinuousClock.now
-                            let preview = try await inference.transcribePreview(samples: window.samples, model: model)
+                            let plan = incrementalPreview.plan(for: window)
+                            let preview = try await LivePreviewPacing.measureAttempt(
+                                recordDuration: { lastPreviewDecode = $0 }
+                            ) {
+                                try await inference.transcribePreview(samples: plan.window.samples, model: model)
+                            }
                             try Task.checkCancellation()
                             guard self.liveCaptureMatches(id, intervalID: intervalID, epoch: epoch) else { return }
                             self.recordPerformance(kind: "speech.preview", milliseconds: started.duration(to: .now).milliseconds)
@@ -973,9 +1171,15 @@ final class WorkspaceModel {
                                     self.recordPerformance(kind: "speech.firstLiveText", milliseconds: requested.duration(to: .now).milliseconds)
                                 }
                             }
-                            self.recordingHUDSession?.receivedPreview(text: preview.text, words: preview.words,
-                                startTime: self.recordingTakeElapsedBeforeInterval + window.startTime,
-                                endTime: self.recordingTakeElapsedBeforeInterval + window.endTime)
+                            self.recordPerformance(kind: "speech.previewAudio", milliseconds: Double(plan.window.samples.count) / 16)
+                            self.recordPerformance(kind: "speech.previewAvailableAudio", milliseconds: Double(window.samples.count) / 16)
+                            guard let merged = incrementalPreview.accept(text: preview.text, words: preview.words, plan: plan) else {
+                                // Keep the prior bounded display until the next full-ring retry.
+                                return
+                            }
+                            self.recordingHUDSession?.receivedPreview(text: merged.text, words: merged.words,
+                                startTime: self.recordingTakeElapsedBeforeInterval + merged.startTime,
+                                endTime: self.recordingTakeElapsedBeforeInterval + merged.endTime)
                             self.recordingHUDSnapshot = self.recordingHUDSession?.snapshot
                         } catch is CancellationError { }
                         catch {
@@ -995,8 +1199,9 @@ final class WorkspaceModel {
                         try await self.runTranscription(id, retryIncomplete: false, maximumCores: 1)
                     }
                 }
-                // Aim for two updates/second, without catch-up jobs or overlapping inference.
-                let next = cycleStarted.advanced(by: .milliseconds(sequence == 0 ? 100 : 500))
+                // Aim for two updates/second, without catch-up jobs or overlapping inference, and
+                // back off on a slow Mac so previews never take more than half of the worker.
+                let next = cycleStarted.advanced(by: LivePreviewPacing.interval(sequence: sequence, lastDecode: lastPreviewDecode))
                 let remaining = ContinuousClock.now.duration(to: next)
                 do { try await Task.sleep(for: max(.milliseconds(20), remaining)) } catch { break }
             }
@@ -1041,7 +1246,42 @@ final class WorkspaceModel {
             let next = ordered[index + 1]
             if next.intervalID == core.intervalID, abs(core.endTime - next.startTime) < 0.05 { window.append(next); hasRightContext = true }
         }
+        // Live capture rotates after the buffer that reaches 5 s, so segments can run slightly long.
+        // Shed context (right first) until the window fits the worker's cap; the core always stays.
+        // hasRightContext still reports the neighbour so recording does not wait for a tail it has.
+        while window.count > 1, window.reduce(0, { $0 + $1.duration }) > LocalInference.maximumWindowSeconds + LocalInference.maximumTrimmedOvershoot {
+            if window.last?.id != core.id { window.removeLast() } else { window.removeFirst() }
+        }
         return (window, hasRightContext)
+    }
+
+    /// Durably registers speech work before inference; retries reconcile any earlier
+    /// failed transition through mutate's dirty-session checkpoint policy.
+    func recordTranscriptionJob(_ job: ProcessingJob, sessionID: UUID) async throws {
+        try await mutate(sessionID, incrementalTranscription: true) { $0.jobs.append(job) }
+    }
+
+    func recordTranscriptionResult(_ output: TranscriptRevision, source: AudioSegment,
+                                   job: ProcessingJob, sessionID: UUID,
+                                   automaticRevisions: [TranscriptRevision] = [],
+                                   automaticPatches: [CorrectionPatch] = []) async throws {
+        try await mutate(sessionID, incrementalTranscription: true) { session in
+            session.transcripts.append(output)
+            session.transcripts.append(contentsOf: automaticRevisions)
+            session.corrections.append(contentsOf: automaticPatches)
+            if var brief = session.brief, let takeIndex = brief.takes.firstIndex(where: {
+                $0.trashedAt == nil && $0.activeIntervalIDs.contains(source.intervalID)
+            }) {
+                let currentID = automaticRevisions.last?.id ?? output.id
+                if !brief.takes[takeIndex].transcriptIDs.contains(currentID) {
+                    brief.takes[takeIndex].transcriptIDs.append(currentID)
+                }
+                brief.reviewedRevisionID = nil
+                session.brief = brief
+            }
+            if let index = session.jobs.firstIndex(where: { $0.id == job.id }) { session.jobs[index] = job }
+            session.invalidateDerivedWork()
+        }
     }
 
     private func runTranscription(_ id: UUID, retryIncomplete: Bool, maximumCores: Int = .max) async throws {
@@ -1071,23 +1311,72 @@ final class WorkspaceModel {
                !context.hasRightContext { continue }
             for segment in window { _ = try await store.audioURL(for: segment, in: id) }
             var job = ProcessingJob(stage: .transcription, status: .running, inputIDs: [core.id], configurationID: configuration.id, totalUnits: 1)
-            try await mutate(id) { $0.jobs.append(job) }
+            try await recordTranscriptionJob(job, sessionID: id)
             do {
                 let startedAt = ContinuousClock.now
-                let result = try await inference.transcribeWindow(segments: window, directory: directory, model: model)
+                var result = try await inference.transcribeWindow(segments: window, directory: directory, model: model, coreSegmentID: core.id)
                 recordPerformance(kind: "speech.window", milliseconds: startedAt.duration(to: .now).milliseconds)
                 try Task.checkCancellation()
-                let validTimings = result.words.allSatisfy { $0.startTime.isFinite && $0.endTime.isFinite && $0.endTime >= $0.startTime && $0.startTime >= window[0].startTime - 0.5 && $0.endTime <= window.last!.endTime + 0.5 }
-                let canCrop = result.transcript.isComplete && validTimings && (!result.words.isEmpty || result.transcript.rawText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                let owned = result.words.filter { word in
-                    let midpoint = (word.startTime + word.endTime) / 2
-                    return midpoint >= core.startTime && midpoint < core.endTime
+                func timingsAreValid(_ result: SpeechWindowResult, in segments: [AudioSegment]) -> Bool {
+                    result.words.allSatisfy { $0.startTime.isFinite && $0.endTime.isFinite && $0.endTime >= $0.startTime && $0.startTime >= segments[0].startTime - 0.5 && $0.endTime <= segments.last!.endTime + 0.5 }
                 }
+                func ownedWords(_ result: SpeechWindowResult) -> [TimedSpeechWord] {
+                    result.words.filter { word in
+                        let midpoint = (word.startTime + word.endTime) / 2
+                        return midpoint >= core.startTime && midpoint < core.endTime
+                    }
+                }
+                var resultSegments = window
+                var canCrop = result.transcript.isComplete && timingsAreValid(result, in: window) && (!result.words.isEmpty || result.transcript.rawText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                var omission: String?
+                // The decoder sometimes skips the start of a long window at a language switch, or the repair of that
+                // gap fails. One omission must not cost the user the whole recording. First decode the segment on its
+                // own, with no neighbours to confuse the switch; if that is still incomplete, the final pass keeps
+                // the best words it has (when their timings are sound) and says where speech may be missing.
+                if !canCrop {
+                    if window.count > 1 {
+                        let alone = try await inference.transcribeWindow(segments: [core], directory: directory, model: model)
+                        try Task.checkCancellation()
+                        let aloneValid = timingsAreValid(alone, in: [core])
+                        if alone.transcript.isComplete, aloneValid,
+                           !alone.words.isEmpty || alone.transcript.rawText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            result = alone; resultSegments = [core]; canCrop = true
+                        } else if aloneValid, ownedWords(alone).count > ownedWords(result).count || !timingsAreValid(result, in: window) {
+                            result = alone; resultSegments = [core]
+                        }
+                    }
+                    if !canCrop, retryIncomplete, timingsAreValid(result, in: resultSegments) {
+                        canCrop = true
+                        omission = String(format: "Possible omission between %d:%02d and %d:%02d: the speech model skipped part of this passage.",
+                                          Int(core.startTime) / 60, Int(core.startTime) % 60, Int(core.endTime) / 60, Int(core.endTime) % 60)
+                    }
+                }
+                let owned = ownedWords(result)
                 var transcript = result.transcript
                 transcript.segmentIDs = [core.id]
                 transcript.startTime = core.startTime
                 transcript.endTime = core.endTime
-                transcript.text = canCrop ? owned.map(\.word).joined(separator: " ") : result.transcript.rawText
+                var seamBridgeWords: [String] = []
+                if canCrop {
+                    let hasLeftContext = resultSegments.first?.id != core.id
+                    let hasRightContext = resultSegments.last?.id != core.id
+                    func words(from lower: Double, to upper: Double) -> [String] {
+                        result.words.filter { word in
+                            let midpoint = (word.startTime + word.endTime) / 2
+                            return midpoint >= lower && midpoint < upper
+                        }.map(\.word)
+                    }
+                    if hasLeftContext, let index = ordered.firstIndex(where: { $0.id == core.id }), index > 0,
+                       ordered[index - 1].intervalID == core.intervalID, abs(ordered[index - 1].endTime - core.startTime) < 0.05,
+                       let previous = seamTails[ordered[index - 1].id] {
+                        seamBridgeWords = Self.seamBridge(tail: previous.words, lead: words(from: core.startTime - Self.seamMargin, to: core.startTime),
+                                                          lastOwned: previous.lastOwned)
+                    }
+                    if seamTails.count > 256 { seamTails.removeAll() }
+                    seamTails[core.id] = SeamTail(words: hasRightContext ? words(from: core.endTime, to: core.endTime + Self.seamMargin) : [],
+                                                  lastOwned: owned.last?.word)
+                }
+                transcript.text = canCrop ? (seamBridgeWords + owned.map(\.word)).joined(separator: " ") : result.transcript.rawText
                 // Dictation retains the owned ASR span, so adjacent context windows cannot duplicate raw output.
                 if snapshot.dictation != nil, canCrop { transcript.rawText = transcript.text }
                 transcript.isComplete = canCrop
@@ -1095,25 +1384,12 @@ final class WorkspaceModel {
                 transcript.replacesID = snapshot.currentTranscripts.last(where: { $0.segmentIDs == [core.id] && !$0.isComplete })?.id
                 job.status = canCrop ? .completed : .incomplete
                 job.completedUnits = canCrop ? 1 : 0
-                job.error = canCrop ? nil : "Native word timing could not reconcile this window. Review the source and confirm a correction before extraction."
+                job.error = canCrop ? omission : "Native word timing could not reconcile this window. Review the source and confirm a correction before extraction."
                 let output = transcript
                 let automatic = canCrop && snapshot.dictation == nil ? self.approvedCorrections(for: output, projectPath: snapshot.projectPath) : (revisions: [TranscriptRevision](), patches: [CorrectionPatch]())
                 let finished = job
-                try await mutate(id) { session in
-                    session.transcripts.append(output)
-                    session.transcripts.append(contentsOf: automatic.revisions)
-                    session.corrections.append(contentsOf: automatic.patches)
-                    if var brief = session.brief, let takeIndex = brief.takes.firstIndex(where: { $0.trashedAt == nil && $0.activeIntervalIDs.contains(core.intervalID) }) {
-                        let currentID = automatic.revisions.last?.id ?? output.id
-                        if !brief.takes[takeIndex].transcriptIDs.contains(currentID) {
-                            brief.takes[takeIndex].transcriptIDs.append(currentID)
-                        }
-                        brief.reviewedRevisionID = nil
-                        session.brief = brief
-                    }
-                    if let index = session.jobs.firstIndex(where: { $0.id == finished.id }) { session.jobs[index] = finished }
-                    session.invalidateDerivedWork()
-                }
+                try await recordTranscriptionResult(output, source: core, job: finished, sessionID: id,
+                    automaticRevisions: automatic.revisions, automaticPatches: automatic.patches)
                 // A resumed take also owns delayed reconciliation of its earlier intervals.
                 refreshRecordingHUDCoverage(sessionID: id, segment: core,
                     text: canCrop ? (automatic.revisions.last?.text ?? output.text) : "", isComplete: canCrop)
@@ -1121,7 +1397,7 @@ final class WorkspaceModel {
                 processedCores += 1
             } catch {
                 let message = error.localizedDescription
-                try? await mutate(id) { session in
+                try? await mutate(id, incrementalTranscription: true) { session in
                     guard let index = session.jobs.firstIndex(where: { $0.id == job.id }) else { return }
                     if session.jobs[index].status == .running {
                         session.jobs[index].status = Task.isCancelled ? .cancelled : .failed
@@ -1303,6 +1579,12 @@ final class WorkspaceModel {
         metricGeneration &+= 1
         performanceMeasurements.append(RuntimeMeasurement(kind: kind, milliseconds: milliseconds))
         if performanceMeasurements.count > 100 { performanceMeasurements.removeFirst(performanceMeasurements.count - 100) }
+    }
+
+    /// A requested diagnostic snapshot; it never launches a worker or renews its residency lease.
+    /// Call outside timed operations. The reply includes grammar/model counters and cached-sample markers.
+    func runtimeResourceSnapshot() async -> [String: UInt64] {
+        await inference?.memorySnapshot() ?? [:]
     }
 
     /// Explicit export contains timings and system/model configuration, never document or audio content.
@@ -1799,12 +2081,17 @@ final class WorkspaceModel {
         }
     }
 
+    /// The worker's own lease ("Keep model loaded", 15 minutes by default) decides when the models
+    /// leave. This only refreshes the memory readout once that lease has run out, and asks the
+    /// worker to release only if it really is idle past its lease. "Always" never expires by time.
     private func scheduleSpeechIdleRelease() {
         speechIdleRelease?.cancel()
+        speechIdleRelease = nil
+        guard let lease = ModelResidencyPolicy.stored(in: .standard).lease else { return }
         speechIdleRelease = Task { @MainActor [weak self] in
-            do { try await Task.sleep(for: .seconds(30)) } catch { return }
+            do { try await Task.sleep(for: lease + .seconds(1)) } catch { return }
             guard let self, !self.isRecording, self.workTask == nil else { return }
-            await self.inference?.releaseSpeech()
+            await self.inference?.releaseIfLeaseExpired()
             self.memoryMeasurements = await self.inference?.memorySnapshot() ?? [:]
         }
     }
@@ -2198,6 +2485,135 @@ final class WorkspaceModel {
             }
         } catch { self.error = error.localizedDescription }
     }
+    // MARK: Dictation history deletion and retention
+
+    /// A session is in use while it captures, finishes, or still has its text on the way to another app.
+    private func isDictationSessionInUse(_ id: UUID) -> Bool {
+        if recordingSessionID == id { return true }
+        if selectedSessionSelection == id,
+           isRecording || isCaptureTransitioning || isEditingRecording || changingSession || workTask != nil { return true }
+        guard let recordings = session(id)?.dictation?.recordings else { return false }
+        return recordings.contains { foregroundDictationTakes.contains($0.id) || [.recording, .paused, .processing].contains($0.state) }
+    }
+
+    /// Permanently deletes whole dictation sessions: audio, transcripts, history and search rows. A session
+    /// that is capturing, finishing or delivering is skipped, never forced. Deleted sessions leave memory
+    /// after the store confirms, and their pending saves are cancelled first so a late save cannot revive them.
+    func deleteDictationSessions(_ ids: [UUID]) async -> DictationDeletionResult {
+        var result = DictationDeletionResult()
+        guard let store, !terminating, !isDeletingDictationHistory else { return result }
+        isDeletingDictationHistory = true
+        defer { isDeletingDictationHistory = false }
+        cancelHistorySelection()
+        var seen = Set<UUID>()
+        for id in ids where seen.insert(id).inserted {
+            guard !isDictationSessionInUse(id) else { result.skippedInUse += 1; continue }
+            // A debounced save that is already writing cannot be cancelled. Let it finish before the delete,
+            // or it would write the session back afterwards.
+            let pendingSave = briefSaveTasks[id]
+            pendingSave?.cancel()
+            briefSaveTasks[id] = nil
+            dirtyBriefSessionIDs.remove(id)
+            await pendingSave?.value
+            _ = try? await persistenceTail?.value
+            // Capture or a delivery may have claimed the session while its saves drained.
+            guard !isDictationSessionInUse(id) else {
+                result.skippedInUse += 1
+                dirtyBriefSessionIDs.insert(id)
+                scheduleBriefSave(id)
+                continue
+            }
+            deletedDictationSessionIDs.insert(id)
+            do { try await store.deleteSession(id) }
+            catch {
+                deletedDictationSessionIDs.remove(id)
+                result.failed += 1
+                result.firstError = result.firstError ?? error.localizedDescription
+                if session(id) != nil { dirtyBriefSessionIDs.insert(id); scheduleBriefSave(id) }
+                continue
+            }
+            sessions.removeAll { $0.id == id }
+            hydratedUseOrder.removeAll { $0 == id }
+            if selectedSessionSelection == id { selectedSessionSelection = nil; selectedBlockIDs = [] }
+            result.deleted += 1
+        }
+        await refreshDictationHistory()
+        return result
+    }
+
+    /// Deletes every saved dictation that is not in use. Developer briefs are untouched.
+    func deleteAllDictationHistory() async -> DictationDeletionResult {
+        var total = DictationDeletionResult()
+        guard let store else { return total }
+        var attempted = Set<UUID>()
+        for _ in 0..<20 {
+            let ids: [UUID]
+            do { ids = try await store.dictationSessionIDs().filter { !attempted.contains($0) } }
+            catch {
+                total.failed += 1
+                total.firstError = total.firstError ?? error.localizedDescription
+                break
+            }
+            guard !ids.isEmpty else { break }
+            attempted.formUnion(ids)
+            total.absorb(await deleteDictationSessions(ids))
+        }
+        return total
+    }
+
+    /// Applies the retention setting. Older finished dictations are deleted, or with Don't keep audio
+    /// only their audio is. It does nothing while capturing or finishing, and skips anything in use.
+    @discardableResult
+    func applyDictationRetention(_ retention: DictationRetention, now: Date = Date()) async -> DictationDeletionResult {
+        var total = DictationDeletionResult()
+        guard let store, !terminating, retention != .forever, !isDeletingDictationHistory,
+              !isRecording, !isCaptureTransitioning, !isEditingRecording, !changingSession,
+              foregroundDictationTakes.isEmpty else { return total }
+        do {
+            if let cutoff = retention.deletionCutoff(now: now) {
+                var attempted = Set<UUID>()
+                for _ in 0..<10 {
+                    let ids = try await store.finishedDictationSessionIDs(newestBefore: cutoff).filter { !attempted.contains($0) }
+                    guard !ids.isEmpty else { break }
+                    attempted.formUnion(ids)
+                    total.absorb(await deleteDictationSessions(ids))
+                }
+            } else if let cutoff = retention.audioCutoff(now: now) {
+                for id in try await store.finishedDictationSessionIDs(newestBefore: cutoff, readyOnly: true) {
+                    guard !isDictationSessionInUse(id), !dirtyBriefSessionIDs.contains(id) else { total.skippedInUse += 1; continue }
+                    _ = try? await persistenceTail?.value
+                    guard !isDictationSessionInUse(id), !dirtyBriefSessionIDs.contains(id),
+                          !isRecording, !isCaptureTransitioning else { total.skippedInUse += 1; continue }
+                    do {
+                        guard let updated = try await store.discardAudio(sessionID: id) else { continue }
+                        if let index = sessions.firstIndex(where: { $0.id == id }), !dirtyBriefSessionIDs.contains(id) {
+                            sessions[index] = updated
+                        }
+                        total.deleted += 1
+                    } catch {
+                        total.failed += 1
+                        total.firstError = total.firstError ?? error.localizedDescription
+                    }
+                }
+            }
+        } catch {
+            total.failed += 1
+            total.firstError = total.firstError ?? error.localizedDescription
+        }
+        if total.deleted > 0 { await refreshDictationHistory() }
+        return total
+    }
+
+    /// Runs the retention setting shortly after a dictation finishes, so that dictation's own audio stays
+    /// available for Retry and playback while the person is still looking at it.
+    private func scheduleDictationRetentionPass() {
+        guard DictationRetention.load() != .forever, store != nil, !terminating else { return }
+        Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: .seconds(DictationRetention.audioGraceSeconds + 5)) } catch { return }
+            await self?.applyDictationRetention(DictationRetention.load())
+        }
+    }
+
     func stopPlayback() { player?.stop(); player = nil; takePlayer.stop() }
     /// Recording tools are addressed by stable identities, never by whichever row is selected later.
     func dictationRecordingForTools(_ handle: DictationRecordingHandle) throws -> RecordingRow {
@@ -2458,12 +2874,16 @@ final class WorkspaceModel {
         } catch { self.error = error.localizedDescription }
     }
 
-    func registerImportedSession(_ imported: VoiceSession) async throws {
+    /// `audioAlreadyWritten` is for a session whose audio folder was created first (a transcribed file), which
+    /// the store already counts as present.
+    func registerImportedSession(_ imported: VoiceSession, audioAlreadyWritten: Bool = false) async throws {
         guard !isRecording, !isCaptureTransitioning, !isEditingRecording, !changingSession else {
             throw KeystormError.message("Pause recording and finish the current change before importing a brief.")
         }
         guard let store else { throw KeystormError.message("The workspace is not ready.") }
-        guard try await !store.containsSession(imported.id) else { throw KeystormError.message("This session is already present.") }
+        if !audioAlreadyWritten, try await store.containsSession(imported.id) {
+            throw KeystormError.message("This session is already present.")
+        }
         var registered = imported
         registered.materializeLegacyRecordings()
         try await store.save(registered)
@@ -2491,6 +2911,7 @@ final class WorkspaceModel {
         speechIdleRelease?.cancel()
         await inference?.shutdown()
         await commitTail?.value
+        await captureFailureTask?.value
         _ = try? await persistenceTail?.value
         _ = try? await dictionaryTail?.value
     }
@@ -2556,6 +2977,7 @@ final class WorkspaceModel {
         guard workTask == nil, !terminating, !isEditingRecording else { error = "Wait for the current operation to finish."; return nil }
         let token = UUID()
         workToken = token
+        workSessionID = selectedSessionID
         isBusy = true
         activity = label
         if clearsError { error = nil }
@@ -2575,13 +2997,18 @@ final class WorkspaceModel {
                 // already ended the worker; otherwise both resident models keep their normal lease.
                 await self.inference?.finishSpeechJob()
             case .general, .textPrewarm:
-                if succeeded { await self.inference?.finishTextJob() }
-                else { await self.inference?.releaseText() }
+                // A request cancelled in flight has already ended the worker, and the client ends
+                // it on a timeout or crash. A failure that left the worker healthy (a rejected
+                // transform, a validation error) keeps its models: unloading them would make
+                // the next dictation pay a cold start for an error that was not the worker's.
+                await self.inference?.finishTextJob()
             }
             if !self.isRecording { self.scheduleSpeechIdleRelease() }
             guard self.workToken == token else { return }
             self.workTask = nil
             self.workToken = nil
+            self.workSessionID = nil
+            self.pruneHydratedSessions()
             self.workKind = .general
             self.isBusy = self.changingCapture
             self.activity = self.isRecording ? "Recording locally" : "Ready"
@@ -2602,6 +3029,19 @@ final class WorkspaceModel {
                                  action: @escaping @MainActor () async throws -> Void) async {
         guard let task = beginWork(label, clearsError: clearsError, kind: .speech, action: action) else { return }
         await task.value
+    }
+
+    /// A mode change or completed startup may warm an installed text model while idle.
+    /// The interaction controller claims this once per mode selection, so idle lease expiry
+    /// does not cause another load. Capture never waits for this task.
+    @discardableResult
+    func prepareNextDictation(mode: DictationQuickMode) -> Bool {
+        guard TextPrewarmPolicy.warmsText(for: mode,
+                  textModelInstalled: installedModelIDs.contains(ModelCatalog.primaryText.id)),
+              !isRecording, !isCaptureTransitioning, !isBusy, !initializing,
+              !terminating, !isEditingRecording, installTokens.isEmpty,
+              let textPrewarm, workTask == nil else { return false }
+        return beginTextPrewarm(textPrewarm) != nil
     }
 
     /// One text-model load per Clean or Email take, started by the live loop after its first
@@ -2675,13 +3115,11 @@ final class WorkspaceModel {
             if hadWork { recordPerformance(kind: "processing.cancel", milliseconds: cancelStarted.duration(to: .now).milliseconds) }
         }
         let task = workTask
-        let kind = workKind
         task?.cancel()
         await task?.value
         await phaseTeardownTail?.value
-        // Cancelled speech work never held the text model; a request in flight already ended the worker.
-        if task != nil, kind != .speech { await inference?.releaseText() }
-        else { await inference?.finishTextJob() }
+        // A request cancelled in flight already ended the worker; otherwise it keeps its lease.
+        await inference?.finishTextJob()
         // Idle models remain bounded by the worker's residency lease.
         if !isRecording { scheduleSpeechIdleRelease() }
     }
@@ -2698,9 +3136,14 @@ final class WorkspaceModel {
         return session
     }
 
-    private func mutate(_ id: UUID, _ change: (inout VoiceSession) throws -> Void) async throws {
+    private func mutate(_ id: UUID, incrementalTranscription: Bool = false,
+                        captureClosure: CaptureClosure? = nil,
+                        _ change: (inout VoiceSession) throws -> Void) async throws {
         guard !isEditingRecording else { throw KeystormError.message("Wait for the recording change to finish.") }
         guard let index = sessions.firstIndex(where: { $0.id == id }), let store else { throw KeystormError.message("The workspace is not ready.") }
+        // A failed or still-pending earlier save can leave multiple transitions in
+        // memory. Reconcile them with a full checkpoint before resuming small deltas.
+        let useTranscriptionDelta = incrementalTranscription && !dirtyBriefSessionIDs.contains(id)
         var copy = sessions[index]
         try change(&copy)
         if copy.transcripts != sessions[index].transcripts || copy.contexts != sessions[index].contexts ||
@@ -2711,26 +3154,147 @@ final class WorkspaceModel {
             copy.brief?.reviewedRevisionID = nil
         }
         copy.updatedAt = Date()
+        // A dirty session can already contain unrelated edits or retryable speech
+        // work. Only this mutation's additions/transitions belong to its rollback.
+        let transcriptionMutation = incrementalTranscription
+            ? RejectedTranscription(before: sessions[index], after: copy) : nil
         sessions[index] = copy
         dirtyBriefSessionIDs.insert(id)
-        try await durableSave(copy, to: store)
+        try await durableSave(copy, to: store, incrementalTranscription: useTranscriptionDelta,
+                              transcriptionMutation: transcriptionMutation, captureClosure: captureClosure)
         if session(id)?.updatedAt == copy.updatedAt { dirtyBriefSessionIDs.remove(id) }
         pruneHydratedSessions()
     }
 
-    private func persist(_ id: UUID) async throws {
+    private func persist(_ id: UUID, captureClosure: CaptureClosure? = nil) async throws {
         guard let store else { return }
-        try await durableSave(requireSession(id), to: store)
+        let snapshot = try requireSession(id)
+        try await durableSave(snapshot, to: store, captureClosure: captureClosure)
+        if session(id)?.updatedAt == snapshot.updatedAt { dirtyBriefSessionIDs.remove(id) }
     }
 
-    private func durableSave(_ snapshot: VoiceSession, to store: SessionStore) async throws {
+    private func retainAcknowledgedTranscription(_ rejected: RejectedTranscription,
+                                                 sessionID: UUID, store: SessionStore) async throws {
+        guard let durable = try await store.loadSession(sessionID) else {
+            throw KeystormError.message("The acknowledged transcription checkpoint is unavailable. Original audio is retained.")
+        }
+        var records = rejectedTranscriptions[sessionID, default: RejectedTranscription()]
+        records.transcriptIDs.formUnion(rejected.transcriptIDs)
+        records.correctionIDs.formUnion(rejected.correctionIDs)
+        let durableJobs = Dictionary(durable.jobs.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        for change in rejected.jobChanges where durableJobs[change.attempted.id] != change.attempted &&
+            !records.jobChanges.contains(change) {
+            records.jobChanges.append(change)
+        }
+        rejectedTranscriptions[sessionID] = records
+        if let index = sessions.firstIndex(where: { $0.id == sessionID }) {
+            sessions[index] = try Self.excludingRejectedTranscription(records, from: sessions[index], durable: durable)
+        }
+    }
+
+    private static func excludingRejectedTranscription(_ rejected: RejectedTranscription,
+                                                        from snapshot: VoiceSession,
+                                                        durable: VoiceSession) throws -> VoiceSession {
+        let transcriptIDs = rejected.transcriptIDs.subtracting(durable.transcripts.map(\.id))
+        let correctionIDs = rejected.correctionIDs.subtracting(durable.corrections.map(\.id))
+        var result = snapshot
+        result.transcripts.removeAll { transcriptIDs.contains($0.id) }
+        result.corrections.removeAll { correctionIDs.contains($0.id) }
+        // An independent later edit must never be silently discarded with its rejected
+        // parent output. Fail closed while preserving that content and its original audio.
+        guard result.transcripts.allSatisfy({ transcriptIDs.isDisjoint(with: $0.replacedRevisionIDs) }),
+              result.corrections.allSatisfy({
+                  !transcriptIDs.contains($0.originalRevisionID) && !transcriptIDs.contains($0.correctedRevisionID)
+              }),
+              result.facts.allSatisfy({ fact in
+                  fact.sources.allSatisfy { !transcriptIDs.contains($0.transcriptID) }
+              }),
+              (result.brief?.sections ?? []).allSatisfy({ section in
+                  section.blocks.allSatisfy { block in
+                      block.sources.allSatisfy { !transcriptIDs.contains($0.transcriptID) }
+                  }
+              }) else {
+            throw KeystormError.message("A later edit depends on transcription that could not be acknowledged. Original audio and pending edits are retained; export before retrying.")
+        }
+        let durableJobs = Dictionary(durable.jobs.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        result.jobs = try result.jobs.compactMap { job in
+            var candidate: ProcessingJob? = job
+            var visited: [ProcessingJob] = []
+            // Queued mutations can have observed an earlier provisional transition.
+            // Unwind only explicitly rejected versions, retaining prior retryable work.
+            while let current = candidate, durableJobs[current.id] != current,
+                  let change = rejected.jobChanges.last(where: { $0.attempted == current }) {
+                guard !visited.contains(current) else {
+                    throw KeystormError.message("Pending speech transitions cannot be reconciled safely. Original audio and pending edits are retained.")
+                }
+                visited.append(current)
+                candidate = change.previous
+            }
+            return candidate
+        }
+        if var brief = result.brief {
+            for index in brief.takes.indices {
+                brief.takes[index].transcriptIDs.removeAll { transcriptIDs.contains($0) }
+            }
+            result.brief = brief
+        }
+        return result
+    }
+
+    private func durableSave(_ snapshot: VoiceSession, to store: SessionStore,
+                             incrementalTranscription: Bool = false,
+                             transcriptionMutation: RejectedTranscription? = nil,
+                             captureClosure: CaptureClosure? = nil) async throws {
         let saveStarted = ContinuousClock.now
         defer { recordPerformance(kind: "brief.persistence", milliseconds: saveStarted.duration(to: .now).milliseconds) }
         let previous = persistenceTail
-        let write = Task {
+        let write = Task { @MainActor [weak self] in
             // A failed previous save does not discard a newer recoverable snapshot.
             _ = try? await previous?.value
-            try await store.save(snapshot)
+            // A session deleted while this save waited must not be written back.
+            if self?.deletedDictationSessionIDs.contains(snapshot.id) == true { return }
+            var checkpoint = snapshot
+            if let self, var rejected = self.rejectedCaptureSegmentIDs[snapshot.id], !rejected.isEmpty {
+                // Explicit recovery may since have acknowledged a retained sidecar. A
+                // capacity rejection must never hide a source that is now durable.
+                if let durable = try await store.loadSession(snapshot.id) {
+                    rejected.subtract(durable.segments.map(\.id))
+                    self.rejectedCaptureSegmentIDs[snapshot.id] = rejected
+                }
+                checkpoint = try Self.excludingUnacknowledgedCapture(rejected, from: snapshot)
+            }
+            if let self, let rejected = self.rejectedTranscriptions[snapshot.id],
+               let durable = try await store.loadSession(snapshot.id) {
+                checkpoint = try Self.excludingRejectedTranscription(rejected, from: checkpoint, durable: durable)
+            }
+            do {
+                if incrementalTranscription { try await store.saveTranscriptionUpdate(checkpoint) }
+                else {
+                    try await store.save(checkpoint, reservingPauseMetadata: transcriptionMutation != nil ||
+                                         checkpoint.intervals.contains { $0.endedAt == nil })
+                }
+            } catch let failure as SessionMetadataCapacityError {
+                if let transcriptionMutation, let self {
+                    // Pending brief edits can require a full checkpoint for a speech
+                    // mutation. Its terminal capacity handling must follow that intent,
+                    // independently of the chosen storage encoding. Retryable I/O keeps
+                    // its pending work; a size rejection restores only unacknowledged
+                    // generated records before releasing queued saves.
+                    try await self.retainAcknowledgedTranscription(transcriptionMutation,
+                                                                   sessionID: checkpoint.id, store: store)
+                }
+                if let captureClosure, var acknowledged = try await store.loadSession(checkpoint.id) {
+                    // The rejected draft remains visible and dirty. Only the exact capture
+                    // closure is retried against acknowledged content, inside this queue,
+                    // so Pause never needs to discard user text or source records.
+                    captureClosure.apply(to: &acknowledged, usingReservedCapacity: true)
+                    // This consumes the closure reserve already held by the acknowledged
+                    // open checkpoint; a late callback may leave other intervals open.
+                    try await store.save(acknowledged)
+                    self?.scheduleHistoryRefresh()
+                }
+                throw failure
+            }
         }
         persistenceTail = write
         try await write.value
@@ -2807,6 +3371,32 @@ private extension Duration {
 #if DEBUG
 /// A canvas-only document. Construction does no I/O and uses no personal application data.
 extension WorkspaceModel {
+    /// Feeds already committed fixture files through the real publication, capacity
+    /// failure, and Pause paths without opening a microphone or loading a model.
+    func commitCapturedAudioForTesting(_ segments: [AudioSegment], sessionID: UUID,
+                                       pauseAfter: Bool = true) async {
+        let mailbox = CommittedAudioMailbox()
+        for segment in segments { mailbox.append(segment) }
+        recordingSessionID = sessionID
+        captureMailbox = mailbox
+        await flushCommits(mailbox, sessionID: sessionID)
+        await captureFailureTask?.value
+        if pauseAfter { await pauseRecording() }
+    }
+
+    func persistCaptureStartForTesting(sessionID: UUID) async throws -> BriefTake {
+        try await persistCaptureStart(sessionID: sessionID, resuming: nil, intervalID: UUID(), finishMode: nil)
+    }
+
+    func failCaptureForTesting(sessionID: UUID, message: String) async {
+        await captureFailed(message, sessionID: sessionID)
+    }
+
+    func persistQueuedSnapshotForTesting(_ snapshot: VoiceSession) async throws {
+        guard let store else { throw KeystormError.message("The workspace is not ready.") }
+        try await durableSave(snapshot, to: store)
+    }
+
     static func workspacePreview() -> WorkspaceModel {
         let model = WorkspaceModel(root: FileManager.default.temporaryDirectory
             .appendingPathComponent("Keystorm-Preview", isDirectory: true))
@@ -2856,12 +3446,19 @@ extension WorkspaceModel: DictationRecordingBackend {
         guard installedModelIDs.contains(ModelCatalog.primarySpeech.id) else {
             throw KeystormError.message("Install the local multilingual speech model in Local Models before recording.")
         }
+        // Capture starts independently; startCapture joins the previous model phase only
+        // before starting inference for this take. Its source session stays pinned meanwhile.
         let previous = selectedSessionID
-        await newSession()
+        // The session stays in memory until startCapture's durable save, which runs before the
+        // microphone opens and also writes the dictation metadata, mode and Recording state.
+        // That is one save before the microphone and one after, instead of six.
+        await createSession(persistImmediately: false, preserveModelWork: true) { session in
+            session.dictation = DictationSession()
+            session.title = "Dictation · " + Date().formatted(date: .abbreviated, time: .shortened)
+        }
         guard let id = selectedSessionID, id != previous else {
             throw KeystormError.message(error ?? "A new dictation recording could not be created.")
         }
-        try await mutate(id) { $0.dictation = DictationSession(); $0.title = "Dictation · " + Date().formatted(date: .abbreviated, time: .shortened) }
         selectedSpeechModelID = ModelCatalog.primarySpeech.id
         captureIntent = .addMaterial
         pendingCaptureQuickMode = mode
@@ -2870,22 +3467,35 @@ extension WorkspaceModel: DictationRecordingBackend {
         guard isRecording, let take = openTake else {
             throw KeystormError.message(error ?? "The microphone could not start. Check Microphone access in System Settings.")
         }
-        let handle = DictationRecordingHandle(sessionID: id, takeID: take.id)
-        do {
-            try await mutate(id) { session in
-                session.materializeDictationMetadata()
-                guard let index = session.dictation?.recordings.firstIndex(where: { $0.id == take.id }) else {
-                    throw KeystormError.message("The recording mode could not be saved.")
-                }
-                session.dictation?.recordings[index].captureMode = mode
-            }
-            try await dictationSave(handle, state: .recording, revision: nil, delivery: nil, failure: nil)
-        }
-        catch {
+        guard dictationMetadata(DictationRecordingHandle(sessionID: id, takeID: take.id))?.state == .recording else {
             await pauseRecording()
-            throw error
+            throw KeystormError.message("The recording mode could not be saved.")
         }
-        return handle
+        return DictationRecordingHandle(sessionID: id, takeID: take.id)
+    }
+
+    /// Whether a file may be transcribed now: nothing is recording, changing or running, and the app is not quitting.
+    var canTranscribeFile: Bool {
+        store != nil && !terminating && !isRecording && !isCaptureTransitioning && !isEditingRecording &&
+            !changingSession && !isBusy
+    }
+
+    /// Where the last Finish kept a passage that may be missing words, or nil when every passage was transcribed in full.
+    func dictationCompletionNotice(_ handle: DictationRecordingHandle) -> String? {
+        guard let session = session(handle.sessionID),
+              let take = session.brief?.takes.first(where: { $0.id == handle.takeID }) else { return nil }
+        let owned = Set(session.takeSegments(take).map(\.id))
+        let latest = Dictionary(session.jobs.filter { $0.stage == .transcription && $0.status == .completed && $0.error != nil &&
+            !Set($0.inputIDs).isDisjoint(with: owned) }.map { ($0.inputIDs.first ?? UUID(), $0) }, uniquingKeysWith: { _, new in new })
+        let passages = Set(latest.keys.filter { id in
+            session.currentTranscripts.contains { $0.segmentIDs == [id] && $0.isComplete }
+        })
+        guard !passages.isEmpty else { return nil }
+        let starts = session.segments.filter { passages.contains($0.id) }.map(\.startTime).sorted()
+        let times = starts.prefix(3).map { String(format: "%d:%02d", Int($0) / 60, Int($0) % 60) }.joined(separator: ", ")
+        return passages.count == 1
+            ? "The speech model may have skipped a few words near \(times). Check that passage."
+            : "The speech model may have skipped words in \(passages.count) passages, for example near \(times). Check them."
     }
 
     func dictationMetadata(_ handle: DictationRecordingHandle) -> DictationRecordingMetadata? {
@@ -2896,6 +3506,11 @@ extension WorkspaceModel: DictationRecordingBackend {
         guard let snapshot = session(handle.sessionID), snapshot.trashedAt == nil,
               let take = snapshot.brief?.takes.first(where: { $0.id == handle.takeID && $0.trashedAt == nil }) else { return nil }
         if recordingSessionID == handle.sessionID, isRecording, openTake?.id == handle.takeID { return .recording }
+        // The microphone stopped without losing audio; the take is already paused and its destination stays valid.
+        if let suspension = captureSuspension, suspension.sessionID == handle.sessionID,
+           snapshot.status == .paused, take.status == .paused {
+            return .suspended(suspension.reason)
+        }
         if snapshot.status == .interrupted {
             return .interrupted(snapshot.gaps.last?.reason ?? "The audio device stopped.")
         }
@@ -2912,6 +3527,9 @@ extension WorkspaceModel: DictationRecordingBackend {
             throw KeystormError.message("The microphone has not stopped. Try Cancel again before starting another recording.")
         }
         tailTranscriptionToken = nil
+        // Cancelling a request in flight ends the worker and both warm models, so a preview or a
+        // warm-up that is about to finish gets a moment to do so. Whatever remains is cancelled.
+        await joinModelWorkBeforeFinish(limit: .seconds(1))
         await cancelProcessing()
         if openTake?.id == handle.takeID { await finishTake() }
         try await dictationSave(handle, state: .cancelled, revision: nil, delivery: nil, failure: nil)
@@ -2934,7 +3552,11 @@ extension WorkspaceModel: DictationRecordingBackend {
         guard openTake?.id == handle.takeID else { throw KeystormError.message("The active recording changed.") }
         await pauseRecording()
         guard !isRecording, !isCaptureTransitioning else { throw KeystormError.message(error ?? "The recording could not pause.") }
-        try await dictationSave(handle, state: .paused, revision: nil, delivery: nil, failure: nil)
+        // The recorder already committed interval, take and dictation state together.
+        // Retry a failed checkpoint instead of treating an in-memory pause as durable.
+        if dirtyBriefSessionIDs.contains(handle.sessionID) || dictationMetadata(handle)?.state != .paused {
+            try await dictationSave(handle, state: .paused, revision: nil, delivery: nil, failure: nil)
+        }
     }
 
     private func prepareDictationMode(_ mode: DictationQuickMode) async throws {
@@ -2962,6 +3584,7 @@ extension WorkspaceModel: DictationRecordingBackend {
         await resumeRecording()
         pendingCaptureQuickMode = nil
         guard isRecording else { throw KeystormError.message(error ?? "The microphone could not resume.") }
+        captureSuspension = nil
         do { try await dictationSave(handle, state: .recording, revision: nil, delivery: nil, failure: nil) }
         catch { await pauseRecording(); throw error }
     }
@@ -2998,10 +3621,11 @@ extension WorkspaceModel: DictationRecordingBackend {
         let snapshot = try requireSession(handle.sessionID)
         let revision = try Self.completeDictationText(in: snapshot, takeID: handle.takeID)
         try await dictationSave(handle, state: .ready, revision: revision, delivery: nil, failure: nil)
-        let terms = await learningDictionary?.suggestions(for: revision.text,
-            appBundleID: dictationMetadata(handle)?.captureAppBundleID) ?? []
+        // Learned spellings, then the manual vocabulary ("My words"), as one staged correction.
+        let application = await learningDictionary?.applyDictionaries(to: revision.text,
+            appBundleID: dictationMetadata(handle)?.captureAppBundleID)
+            ?? LearnedTermApplication(text: revision.text, termIDs: [])
         try Task.checkCancellation()
-        let application = LearnedTermApplicator.apply(suggestions: terms, to: revision.text)
         if !application.termIDs.isEmpty {
             do {
                 try await editLibrarySession(handle.sessionID, sourceChange: false) { session in
@@ -3015,8 +3639,66 @@ extension WorkspaceModel: DictationRecordingBackend {
                 recoveryMessages.append("A learned spelling could not be applied; the original transcript was kept.")
             }
         }
+        scheduleDictationRetentionPass()
         dismissRecordingHUD()
         return dictationMetadata(handle)?.textRevision ?? revision
+    }
+
+    /// How far past a segment edge a word's midpoint may sit and still count as heard at the seam. The two windows on
+    /// either side time one word up to a frame (80 ms) apart, so this comfortably covers the disagreement.
+    nonisolated static let seamMargin = 0.2
+
+    /// Words a window heard just after its right edge (`words`), and the last word it kept (`lastOwned`).
+    nonisolated struct SeamTail: Sendable {
+        var words: [String]
+        var lastOwned: String?
+    }
+
+    /// The word or words at a seam that neither neighbour kept. Each window keeps the words whose midpoint falls inside
+    /// its own segment, but the two time one word slightly differently. The left window can place it just past its end
+    /// while the right window places it just before its start, and then both drop it. When the left window's words
+    /// just past its end (`tail`) match the right window's words just before its start (`lead`), both heard the same
+    /// words on the seam and nobody kept them, so they are returned. A word equal to the one the left window
+    /// already ended on is left out, because that is a repeated word, not a lost one.
+    nonisolated static func seamBridge(tail: [String], lead: [String], lastOwned: String?) -> [String] {
+        func key(_ word: String) -> String { word.lowercased().filter { $0.isLetter || $0.isNumber } }
+        var count = min(tail.count, lead.count, 3)
+        while count > 0 {
+            let matches = zip(tail.prefix(count), lead.suffix(count)).allSatisfy { !key($0).isEmpty && key($0) == key($1) }
+            if matches { break }
+            count -= 1
+        }
+        guard count > 0 else { return [] }
+        let bridge = Array(tail.prefix(count))
+        if let lastOwned, key(lastOwned) == key(bridge[0]) { return [] }
+        return bridge
+    }
+
+    /// Joins the per-segment transcripts of a take. Each segment is decoded in its own window, so a word that
+    /// straddles the seam between two segments can come out twice ("über über", "días días"). When one segment
+    /// ends and the next starts with the same word, directly adjacent in the audio, the second copy goes; sentence
+    /// punctuation it carried moves to the first. Someone really saying a word twice exactly at a seam is rare
+    /// next to the decoder doing it, and a double word anywhere else is never touched.
+    static func stitchedText(_ transcripts: [TranscriptRevision], _ text: KeyPath<TranscriptRevision, String>) -> String {
+        func key(_ word: Substring) -> String { word.lowercased().filter { $0.isLetter || $0.isNumber } }
+        func trailingPunctuation(_ word: Substring) -> String { String(word.reversed().prefix { !$0.isLetter && !$0.isNumber }.reversed()) }
+        var output: [String] = []
+        var previous: TranscriptRevision?
+        for transcript in transcripts {
+            var words = transcript[keyPath: text].split(whereSeparator: \.isWhitespace)
+            if let previous, abs(previous.endTime - transcript.startTime) < 0.05,
+               let lastIndex = output.indices.last, let incoming = words.first {
+                let kept = output[lastIndex]
+                if !key(incoming).isEmpty, key(incoming) == key(Substring(kept)) {
+                    let punctuation = trailingPunctuation(incoming)
+                    if !punctuation.isEmpty, trailingPunctuation(Substring(kept)).isEmpty { output[lastIndex] = kept + punctuation }
+                    words.removeFirst()
+                }
+            }
+            output.append(contentsOf: words.map(String.init))
+            if !words.isEmpty { previous = transcript } else if previous != nil { previous = transcript }
+        }
+        return output.joined(separator: " ")
     }
 
     /// Never expose a partial window as a complete insertion candidate.
@@ -3070,9 +3752,22 @@ extension WorkspaceModel: DictationRecordingBackend {
               ids.allSatisfy({ id in transcripts.filter { $0.segmentIDs.contains(id) }.count == 1 }) else {
             throw KeystormError.message("Some saved audio has not been transcribed completely. Nothing was inserted; finish again to retry.")
         }
-        let rawText = transcripts.map(\.rawText).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
-        let text = transcripts.map(\.text).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { throw KeystormError.message("No speech was recognized. The original audio is saved.") }
+        let rawText = stitchedText(transcripts, \.rawText).trimmingCharacters(in: .whitespacesAndNewlines)
+        var text = stitchedText(transcripts, \.text).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { throw DictationNoSpeechError() }
+        // Spoken punctuation and line breaks ("comma", "new line", "Absatz") become symbols here, before any
+        // Clean or Email step. The raw transcript stays as recognized.
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: DictationPreferences.spokenFormattingCommandsKey) == nil ||
+            defaults.bool(forKey: DictationPreferences.spokenFormattingCommandsKey) {
+            let formatted = DictationSpokenFormatting.apply(to: text).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !formatted.isEmpty { text = formatted }
+        }
+        // Clean and Email start from text without fillers and stutters; Verbatim stays as recognized.
+        if let mode = snapshot.dictation?.recordings.first(where: { $0.id == takeID })?.captureMode,
+           mode == .clean || mode == .email {
+            text = DictationFillerCleanup.apply(to: text)
+        }
         return DictationTextRevision(rawText: rawText, text: text, sourceTranscriptIDs: transcripts.map(\.id))
     }
 

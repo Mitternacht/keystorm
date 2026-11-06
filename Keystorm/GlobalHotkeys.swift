@@ -64,10 +64,24 @@ struct GlobalShortcut: Codable, Hashable, Sendable {
     var displayName: String { modifiers.symbols + keyLabel }
     func matches(_ other: Self) -> Bool { keyCode == other.keyCode && modifiers == other.modifiers }
 
+    /// The key of a shortcut that is one modifier alone (Fn, right Command, ...). Carbon cannot register these;
+    /// `ModifierShortcutMonitor` observes them instead, which needs Accessibility.
+    var modifierKey: ModifierKey? {
+        guard modifiers.isEmpty, let code = UInt16(exactly: keyCode) else { return nil }
+        return ModifierKey(rawValue: code)
+    }
+    var isModifierOnly: Bool { modifierKey != nil }
+
     func validate() throws {
         guard keyCode <= 126, !keyLabel.isEmpty, keyLabel.utf8.count <= 48,
               modifiers.subtracting(.supported).isEmpty else {
             throw ShortcutError.invalid("Unsupported key or modifier.")
+        }
+        if let key = modifierKey {
+            guard key.isAllowedAlone else {
+                throw ShortcutError.invalid("Shift alone is used for capital letters. Choose Fn, Control, Option, or Command.")
+            }
+            return
         }
         guard !modifiers.intersection([.command, .option, .control]).isEmpty else {
             throw ShortcutError.invalid("Include Command, Option, or Control so normal typing stays available.")
@@ -116,6 +130,9 @@ struct GlobalShortcut: Codable, Hashable, Sendable {
     init(keyCode: UInt32, modifiers: ShortcutModifiers, keyLabel: String) {
         self.keyCode = keyCode; self.modifiers = modifiers; self.keyLabel = keyLabel
     }
+    init(modifierKey key: ModifierKey) {
+        keyCode = UInt32(key.rawValue); modifiers = []; keyLabel = key.label
+    }
 }
 
 enum ShortcutError: Error, LocalizedError, Equatable {
@@ -139,9 +156,9 @@ enum ShortcutRegistration: Equatable {
 struct ShortcutPreferences: Codable, Equatable {
     var version = 2
     var shortcuts: [String: GlobalShortcut]
+    /// A fresh install binds no developer-brief recording shortcut (toggleRecording, recordEdit): the Brief is legacy.
+    /// Saved preferences are decoded as stored, so existing users keep what they have.
     static let defaults = Self(shortcuts: [
-        ShortcutAction.toggleRecording.rawValue: .init(keyCode: 49, modifiers: [.command, .shift], keyLabel: "Space"),
-        ShortcutAction.recordEdit.rawValue: .init(keyCode: 14, modifiers: [.command, .option, .shift], keyLabel: "E"),
         ShortcutAction.showWorkspace.rawValue: .init(keyCode: 11, modifiers: [.command, .option, .shift], keyLabel: "B"),
         ShortcutAction.toggleDictation.rawValue: .init(keyCode: 2, modifiers: [.command, .option, .shift], keyLabel: "D"),
         ShortcutAction.pauseResumeDictation.rawValue: .init(keyCode: 35, modifiers: [.command, .option, .shift], keyLabel: "P")
@@ -195,8 +212,18 @@ final class ShortcutManager {
     private(set) var dispatchCount: UInt64 = 0
     private(set) var recordingBehavior: RecordingBehavior
     private(set) var isHoldingRecording = false
+    /// How the dictation shortcut reacts to press and release. Tap-to-toggle and hold-to-talk by default.
+    private(set) var dictationShortcutMode: DictationShortcutMode
+    /// Whether the single-modifier watcher runs. Unavailable (with the reason) when it cannot be installed.
+    private(set) var modifierMonitorStatus: ModifierMonitorStatus = .inactive
     @ObservationIgnored var onAction: (@MainActor (ShortcutAction) -> Void)?
     @ObservationIgnored var onHoldRecording: (@MainActor (Bool) -> Void)?
+    /// Start/finish commands for the dictation shortcut. Without a receiver they fall back to `onAction(.toggleDictation)`.
+    @ObservationIgnored var onDictationCommand: (@MainActor (DictationGestureCommand) -> Void)?
+    /// True while a dictation is starting, recording or paused, so a press finishes instead of starting.
+    @ObservationIgnored var isDictationActive: (@MainActor () -> Bool)?
+    @ObservationIgnored private var gesture: DictationGestureMachine
+    @ObservationIgnored private let modifierMonitor: any ModifierShortcutMonitoring
     @ObservationIgnored private let defaults: UserDefaults
     @ObservationIgnored private let registerOperation: ShortcutRegistrationOperation
     @ObservationIgnored private var sleepObserver: NSObjectProtocol?
@@ -207,15 +234,21 @@ final class ShortcutManager {
     @ObservationIgnored private var suspendedForCapture = false
     @ObservationIgnored private var dispatchNotBefore: UInt64 = 0
     private static let storageKey = "Keystorm.globalShortcuts.v1"
+    private static let dictationModeKey = "Keystorm.dictationShortcutMode.v1"
 
     init(defaults: UserDefaults = .standard,
          registerOperation: @escaping ShortcutRegistrationOperation = { shortcut, action, reference in
              RegisterEventHotKey(shortcut.keyCode, shortcut.modifiers.carbon,
                  EventHotKeyID(signature: keystormHotkeySignature, id: action.carbonID),
                  GetApplicationEventTarget(), 0, &reference)
-         }) {
+         },
+         modifierMonitor: (any ModifierShortcutMonitoring)? = nil) {
         self.defaults = defaults
         self.registerOperation = registerOperation
+        self.modifierMonitor = modifierMonitor ?? ModifierShortcutMonitor()
+        let storedMode = DictationShortcutMode(rawValue: defaults.string(forKey: Self.dictationModeKey) ?? "") ?? .tapOrHold
+        dictationShortcutMode = storedMode
+        gesture = DictationGestureMachine(mode: storedMode)
         recordingBehavior = RecordingBehavior(rawValue: defaults.string(forKey: "Keystorm.recordingBehavior.v1") ?? "") ?? .toggle
         if let data = defaults.data(forKey: Self.storageKey),
            let decoded = try? JSONDecoder().decode(ShortcutPreferences.self, from: data), (1...2).contains(decoded.version) {
@@ -231,9 +264,11 @@ final class ShortcutManager {
                 if let migrated = try? JSONEncoder().encode(preferences) { defaults.set(migrated, forKey: Self.storageKey) }
             }
         } else { preferences = .defaults }
+        self.modifierMonitor.onOutput = { [weak self] output in self?.handleModifierOutput(output) }
     }
 
     isolated deinit {
+        modifierMonitor.stop()
         for reference in references.values { UnregisterEventHotKey(reference) }
         if let handler { RemoveEventHandler(handler) }
         if let sleepObserver { NSWorkspace.shared.notificationCenter.removeObserver(sleepObserver) }
@@ -276,6 +311,7 @@ final class ShortcutManager {
 
     func stop() {
         endHoldRecording()
+        modifierMonitor.stop(); modifierMonitorStatus = .inactive; gesture.reset()
         for reference in references.values { UnregisterEventHotKey(reference) }
         references.removeAll()
         if let handler { RemoveEventHandler(handler) }
@@ -290,11 +326,13 @@ final class ShortcutManager {
         guard suspendedForCapture != suspended else { return }
         suspendedForCapture = suspended
         endHoldRecording()
+        gesture.reset()
         dispatchNotBefore = DispatchTime.now().uptimeNanoseconds
         sink?.gate.reset()
         if suspended {
             for reference in references.values { UnregisterEventHotKey(reference) }
             references.removeAll()
+            modifierMonitor.stop(); modifierMonitorStatus = .inactive
         } else if started && handler != nil { registerConfigured() }
     }
 
@@ -302,13 +340,21 @@ final class ShortcutManager {
         do {
             if let shortcut {
                 try shortcut.validate()
+                if shortcut.isModifierOnly && action != .toggleDictation {
+                    throw ShortcutError.invalid("Only the dictation shortcut can be a single modifier key.")
+                }
                 if let other = ShortcutAction.allCases.first(where: {
                     $0 != action && self.shortcut(for: $0)?.matches(shortcut) == true
                 }) { throw ShortcutError.duplicate(other.title) }
             }
-            if shortcut == self.shortcut(for: action) { lastError = nil; return }
+            if shortcut == self.shortcut(for: action) {
+                // Clearing an already cleared recording shortcut still releases a take that it holds.
+                if shortcut == nil && action == .toggleRecording { endHoldRecording() }
+                lastError = nil
+                return
+            }
             var newReference: EventHotKeyRef?
-            if let shortcut, started, !suspendedForCapture, handler != nil {
+            if let shortcut, !shortcut.isModifierOnly, started, !suspendedForCapture, handler != nil {
                 let result = registerOperation(shortcut, action, &newReference)
                 guard result == noErr, newReference != nil else { throw ShortcutError.registration(result) }
             }
@@ -318,6 +364,7 @@ final class ShortcutManager {
             if let newReference { references[action] = newReference }
             preferences.shortcuts[action.rawValue] = shortcut
             registration[action] = shortcut == nil ? .disabled : (newReference == nil ? .disabled : .registered)
+            if action == .toggleDictation { refreshModifierShortcut() }
             defaults.set(try JSONEncoder().encode(preferences), forKey: Self.storageKey)
             lastError = nil
         } catch { lastError = error.localizedDescription; throw error }
@@ -340,8 +387,24 @@ final class ShortcutManager {
         defaults.set(value.rawValue, forKey: "Keystorm.recordingBehavior.v1")
     }
 
+    func setDictationShortcutMode(_ value: DictationShortcutMode) {
+        guard value != dictationShortcutMode else { return }
+        gesture.reset()
+        gesture.mode = value
+        dictationShortcutMode = value
+        defaults.set(value.rawValue, forKey: Self.dictationModeKey)
+    }
+
+    /// Forgets a held dictation shortcut, so its release cannot finish a take that something else ended (Escape).
+    func cancelDictationGesture() { gesture.reset() }
+
     // Called after Carbon registration/epoch validation. Shared with deterministic lifecycle tests.
     func handleShortcut(_ action: ShortcutAction, pressed: Bool, enqueuedAt: UInt64) {
+        if action == .toggleDictation {
+            // The same edges as every Carbon key, in the same clock, so a hold is measured at the key, not on the main queue.
+            handleDictationKey(pressed: pressed, at: TimeInterval(enqueuedAt) / 1_000_000_000, enqueuedAt: enqueuedAt)
+            return
+        }
         if action == .toggleRecording && recordingBehavior == .hold {
             if pressed {
                 guard !isHoldingRecording else { return }
@@ -357,6 +420,8 @@ final class ShortcutManager {
         // Sleep can swallow a release event. Invalidate queued presses and relinquish an owned held take.
         dispatchNotBefore = DispatchTime.now().uptimeNanoseconds
         sink?.gate.reset()
+        gesture.reset()
+        modifierMonitor.reset()
         endHoldRecording()
     }
 
@@ -364,6 +429,45 @@ final class ShortcutManager {
         guard isHoldingRecording else { return }
         isHoldingRecording = false
         onHoldRecording?(false)
+    }
+
+    /// Press and release edges of the dictation shortcut, from Carbon or the modifier monitor.
+    /// `time` is in seconds on one clock per source; only differences between a press and its release matter.
+    private func handleDictationKey(pressed: Bool, at time: TimeInterval, enqueuedAt: UInt64?) {
+        let command = pressed ? gesture.press(at: time, isActive: isDictationActive?() ?? false)
+                              : gesture.release(at: time)
+        guard let command else { return }
+        if let enqueuedAt { lastDispatchNanoseconds = DispatchTime.now().uptimeNanoseconds &- enqueuedAt }
+        dispatchCount &+= 1
+        if let onDictationCommand { onDictationCommand(command) } else { onAction?(.toggleDictation) }
+    }
+
+    private func handleModifierOutput(_ output: ModifierOnlyDetector.Output) {
+        guard started, !suspendedForCapture, registration[.toggleDictation] == .registered else { return }
+        switch output {
+        case .pressed(let time): handleDictationKey(pressed: true, at: time, enqueuedAt: nil)
+        case .released(let time): handleDictationKey(pressed: false, at: time, enqueuedAt: nil)
+        }
+    }
+
+    /// Starts the modifier monitor when the dictation shortcut is a single modifier key, otherwise stops it.
+    private func refreshModifierShortcut() {
+        modifierMonitor.stop(); modifierMonitorStatus = .inactive
+        gesture.reset()
+        guard started, !suspendedForCapture, handler != nil,
+              let shortcut = shortcut(for: .toggleDictation), shortcut.isModifierOnly else { return }
+        registration[.toggleDictation] = activateModifierShortcut(shortcut)
+    }
+
+    private func activateModifierShortcut(_ shortcut: GlobalShortcut) -> ShortcutRegistration {
+        guard let key = shortcut.modifierKey else { return .unavailable("Unsupported modifier key.") }
+        let status = modifierMonitor.start(key: key)
+        modifierMonitorStatus = status
+        switch status {
+        case .active: return .registered
+        case .unavailable(let message): return .unavailable(message)
+        case .inactive: return .disabled
+        }
     }
 
     private func dispatch(_ action: ShortcutAction, enqueuedAt: UInt64) {
@@ -378,6 +482,7 @@ final class ShortcutManager {
         endHoldRecording()
         for reference in references.values { UnregisterEventHotKey(reference) }
         references.removeAll(); sink?.gate.reset()
+        modifierMonitor.stop(); modifierMonitorStatus = .inactive; gesture.reset()
         dispatchNotBefore = DispatchTime.now().uptimeNanoseconds
         var seen: [GlobalShortcut] = []
         for action in ShortcutAction.allCases {
@@ -386,6 +491,13 @@ final class ShortcutManager {
                 try shortcut.validate()
                 guard !seen.contains(where: { $0.matches(shortcut) }) else { throw ShortcutError.invalid("Duplicate stored shortcut. Assign a different combination.") }
                 seen.append(shortcut)
+                if shortcut.isModifierOnly {
+                    guard action == .toggleDictation else {
+                        throw ShortcutError.invalid("Only the dictation shortcut can be a single modifier key.")
+                    }
+                    registration[action] = activateModifierShortcut(shortcut)
+                    continue
+                }
                 var reference: EventHotKeyRef?
                 let status = registerOperation(shortcut, action, &reference)
                 guard status == noErr, let reference else { throw ShortcutError.registration(status) }

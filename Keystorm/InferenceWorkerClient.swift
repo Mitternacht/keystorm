@@ -9,6 +9,8 @@ actor InferenceWorkerClient {
     private struct Pending {
         let generation: UUID
         let continuation: CheckedContinuation<InferenceWorkerReply, any Error>
+        /// Memory and ping probes do not extend the model lease; real work does.
+        let countsAsUse: Bool
         var timeout: Task<Void, Never>?
     }
 
@@ -24,19 +26,33 @@ actor InferenceWorkerClient {
     private var lastFailureMemory: [String: UInt64] = [:]
     private var lastWorkerTerminationStatus: UInt64 = 0
     private var idleRelease: Task<Void, Never>?
-    private let idleRetention: Duration
+    /// The worker stays warm for a long lease (see `ModelResidencyPolicy`), never for a fixed
+    /// 30 seconds. The policy is read again at every check, so a Settings change applies at once.
+    private var lease: ModelResidencyLease
+    private let residencyPolicy: @Sendable () -> ModelResidencyPolicy
+    private let clock: @Sendable () -> ContinuousClock.Instant
+    private var memoryPressureSource: (any DispatchSourceMemoryPressure)?
+    /// Set by critical memory pressure during a job: the worker leaves as soon as that job ends.
+    private var unloadWhenIdle = false
     /// Warming never starts while artifacts may change on disk.
     private var installsInProgress = 0
 
+    /// `idleRetention` replaces the policy's lease. Tests use it to expire a worker quickly;
+    /// the app leaves it nil and follows the "Keep model loaded" preference.
     init(modelDirectory: URL, executableURL: URL? = Bundle.main.executableURL,
-         idleRetention: Duration = .seconds(45)) {
+         idleRetention: Duration? = nil,
+         residencyPolicy: @escaping @Sendable () -> ModelResidencyPolicy = { ModelResidencyPolicy.stored(in: .standard) },
+         clock: @escaping @Sendable () -> ContinuousClock.Instant = { ContinuousClock.now }) {
         self.modelDirectory = modelDirectory
         self.executableURL = executableURL
-        self.idleRetention = max(.zero, min(idleRetention, .seconds(45)))
+        self.residencyPolicy = residencyPolicy
+        self.clock = clock
+        lease = ModelResidencyLease(policy: residencyPolicy(), leaseOverride: idleRetention, now: clock())
         metadata = LocalInference(modelDirectory: modelDirectory)
     }
 
     deinit {
+        memoryPressureSource?.cancel()
         idleRelease?.cancel()
         readerTask?.cancel()
         if let worker {
@@ -120,11 +136,13 @@ actor InferenceWorkerClient {
         try await transcribeWindow(segments: segments, directory: directory, model: model).transcript
     }
 
-    func transcribeWindow(segments: [AudioSegment], directory: URL, model: ModelDescriptor) async throws -> SpeechWindowResult {
+    func transcribeWindow(segments: [AudioSegment], directory: URL, model: ModelDescriptor,
+                          coreSegmentID: UUID? = nil) async throws -> SpeechWindowResult {
         _ = try await configuration(for: model)
         await transition(to: .speech)
-        let request = InferenceWorkerRequest(operation: .speech, modelID: model.id,
+        var request = InferenceWorkerRequest(operation: .speech, modelID: model.id,
             audioDirectory: directory, segments: segments)
+        request.coreSegmentID = coreSegmentID
         let reply = try await call(request, timeoutSeconds: 180)
         guard let result = reply.speech else { throw KeystormError.message("The speech worker returned no complete result.") }
         return result
@@ -202,7 +220,8 @@ actor InferenceWorkerClient {
         return edits
     }
 
-    /// Successful jobs retain their model and immutable grammar resources briefly.
+    /// Finished jobs leave their model and immutable grammar resources resident for the lease
+    /// of the "Keep model loaded" preference (15 minutes by default), or until memory pressure.
     /// One child owns both models; every actual inference job remains serialized.
     func finishTextJob() { scheduleIdleRelease() }
     func finishSpeechJob() { scheduleIdleRelease() }
@@ -237,11 +256,13 @@ actor InferenceWorkerClient {
             "mlxCache": lastWorkerMemory["mlxCache"] ?? 0,
             "mlxPeak": lastWorkerMemory["mlxPeak"] ?? 0,
             "integrityVerificationCount": lastWorkerMemory["integrityVerificationCount"] ?? 0,
+            "integrityCacheHits": lastWorkerMemory["integrityCacheHits"] ?? 0,
             "workerMemoryIsCached": pending.isEmpty ? 0 : 1,
             "lastWorkerTerminationStatus": lastWorkerTerminationStatus
         ]
         measurements.merge(lastWorkerMemory.filter {
             $0.key.hasPrefix("grammar") || $0.key.hasPrefix("textModel") || $0.key.hasPrefix("speechModel") ||
+            $0.key.hasPrefix("transform") ||
             ["workerPeakFootprint", "workerRequestPeakFootprint", "workerMemoryCeiling", "workerFootprintSamples"].contains($0.key)
         }) { _, new in new }
         for (key, value) in lastFailureMemory { measurements["lastFailure." + key] = value }
@@ -292,6 +313,8 @@ actor InferenceWorkerClient {
         guard pending.isEmpty else { throw KeystormError.message("Wait for the current local worker job to finish.") }
         idleRelease?.cancel()
         idleRelease = nil
+        let countsAsUse = ![.memory, .ping].contains(original.operation)
+        if countsAsUse { lease.touch(at: clock()) }
         let box = try ensureWorker()
         var request = original
         request.parentFootprint = LocalInference.processFootprint()
@@ -305,7 +328,8 @@ actor InferenceWorkerClient {
                     do { try await Task.sleep(for: .seconds(timeoutSeconds)) } catch { return }
                     await self?.requestTimedOut(requestID, generation: generation)
                 }
-                pending[requestID] = Pending(generation: generation, continuation: continuation, timeout: timeout)
+                pending[requestID] = Pending(generation: generation, continuation: continuation,
+                                             countsAsUse: countsAsUse, timeout: timeout)
                 Task.detached(priority: .userInitiated) { [weak self] in
                     do { try box.input.fileHandleForWriting.write(contentsOf: frame) }
                     catch { await self?.transportFailed(generation: generation) }
@@ -341,6 +365,9 @@ actor InferenceWorkerClient {
         }
         try box.process.run()
         worker = box
+        // A fresh worker gets a full lease even when its first call is only a probe.
+        lease.touch(at: clock())
+        installMemoryPressureMonitor()
         let reader = InferenceWorkerFrameReader(file: box.output.fileHandleForReading)
         readerTask = Task.detached(priority: .userInitiated) { [weak self] in
             do {
@@ -362,7 +389,7 @@ actor InferenceWorkerClient {
         waiting.timeout?.cancel()
         lastWorkerMemory = reply.memory
         if !reply.succeeded { lastFailureMemory = reply.memory }
-        scheduleIdleRelease()
+        scheduleIdleRelease(countsAsUse: waiting.countsAsUse)
         let sampledRequestExceeded = (reply.memory["workerRequestPeakFootprint"] ?? 0) >=
             (reply.memory["workerMemoryCeiling"] ?? UInt64.max)
         if sampledRequestExceeded || LocalInference.processFootprint() + (reply.memory["processFootprint"] ?? 0) >= 6 * 1_024 * 1_024 * 1_024 {
@@ -405,16 +432,31 @@ actor InferenceWorkerClient {
 
     private func processExited(generation: UUID) async { await transportFailed(generation: generation) }
 
-    private func scheduleIdleRelease() {
+    /// Ending a job (or an explicit finish) restarts the lease. A timer sleeps toward its end in
+    /// bounded steps and re-reads the policy each time, so it also follows a Settings change.
+    private func scheduleIdleRelease(countsAsUse: Bool = true) {
         idleRelease?.cancel()
         idleRelease = nil
         guard let generation = worker?.generation, pending.isEmpty else { return }
-        let retention = idleRetention
+        if countsAsUse { lease.touch(at: clock()) }
         idleRelease = Task { [weak self] in
-            do { try await Task.sleep(for: retention) } catch { return }
-            guard !Task.isCancelled else { return }
-            await self?.releaseIdleWorker(generation: generation)
+            while !Task.isCancelled {
+                guard let wait = await self?.idleWait(generation: generation) else { return }
+                if wait <= .zero {
+                    await self?.releaseIdleWorker(generation: generation)
+                    return
+                }
+                do { try await Task.sleep(for: wait) } catch { return }
+            }
         }
+    }
+
+    /// Nil when this worker is gone or busy, so the timer stops. Zero means release now.
+    private func idleWait(generation: UUID) -> Duration? {
+        guard worker?.generation == generation, pending.isEmpty else { return nil }
+        lease.policy = residencyPolicy()
+        if unloadWhenIdle { return .zero }
+        return lease.nextCheck(at: clock())
     }
 
     private func releaseIdleWorker(generation: UUID) async {
@@ -422,9 +464,48 @@ actor InferenceWorkerClient {
         await stopWorker(reason: CancellationError())
     }
 
+    /// Unloads the worker only when its lease has run out (or memory pressure asked for it).
+    /// Safe to call at any time: a busy or still-leased worker is left alone.
+    func releaseIfLeaseExpired() async {
+        guard worker != nil, pending.isEmpty else { return }
+        lease.policy = residencyPolicy()
+        guard unloadWhenIdle || lease.isExpired(at: clock()) else { return }
+        await stopWorker(reason: CancellationError())
+    }
+
+    /// The lease is the only reason a healthy worker leaves; this is the other one. The system
+    /// asks apps to shrink, and the worker holds several gigabytes of model weights.
+    private func installMemoryPressureMonitor() {
+        guard memoryPressureSource == nil else { return }
+        let source = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical],
+                                                             queue: .global(qos: .utility))
+        source.setEventHandler { [weak self, source] in
+            let pressure: ModelMemoryPressure = source.data.contains(.critical) ? .critical : .warning
+            Task { [weak self] in await self?.handleMemoryPressure(pressure) }
+        }
+        source.resume()
+        memoryPressureSource = source
+    }
+
+    private func handleMemoryPressure(_ pressure: ModelMemoryPressure) async {
+        guard worker != nil else { return }
+        switch lease.action(for: pressure, hasPendingJob: !pending.isEmpty, at: clock()) {
+        case .keep: break
+        case .unloadAfterJob: unloadWhenIdle = true
+        case .unloadNow: await stopWorker(reason: CancellationError())
+        }
+    }
+
+    #if DEBUG
+    func simulateMemoryPressureForTesting(_ pressure: ModelMemoryPressure) async {
+        await handleMemoryPressure(pressure)
+    }
+    #endif
+
     private func stopWorker(reason: any Error) async {
         idleRelease?.cancel()
         idleRelease = nil
+        unloadWhenIdle = false
         if let stopping { await stopping.value; return }
         guard let box = worker else { phase = .none; return }
         worker = nil

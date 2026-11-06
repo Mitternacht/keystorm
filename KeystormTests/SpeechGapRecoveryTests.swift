@@ -20,6 +20,32 @@ struct SpeechGapRecoveryTests {
         #expect(SpeechGapRecovery.uncoveredSpeechRanges(samples: samples, words: words).isEmpty)
     }
 
+    @Test("A repair that loops on the same words is rejected, so the gap stays open instead of inventing text",
+          arguments: [
+            ["necesitamos", "un", "precio", "de", "la", "precio", "de", "la", "precio", "de", "la", "precio"],
+            ["the", "the", "the", "plan"],
+            ["Ja,", "ja,", "ja!", "gut"]
+          ])
+    func loopingRepairIsRejected(words: [String]) throws {
+        #expect(SpeechGapRecovery.hasDegenerateRepetition(words))
+        let timed = words.enumerated().map { TimedSpeechWord(word: $1, startTime: Double($0) * 0.3, endTime: Double($0) * 0.3 + 0.25) }
+        let kept = try SpeechGapRecovery.validatedRepairWords(timed, repairStart: 0, repairDuration: 5, ownedGap: 0..<5)
+        #expect(kept.isEmpty)
+    }
+
+    @Test("Ordinary speech with a repeated word or a stutter is still recovered",
+          arguments: [
+            ["we", "had", "had", "enough"],
+            ["very", "very", "good", "idea"],
+            ["no", "no", "yes", "no", "no", "yes"]
+          ])
+    func ordinaryRepeatsAreKept(words: [String]) throws {
+        #expect(!SpeechGapRecovery.hasDegenerateRepetition(words))
+        let timed = words.enumerated().map { TimedSpeechWord(word: $1, startTime: Double($0) * 0.3, endTime: Double($0) * 0.3 + 0.25) }
+        let kept = try SpeechGapRecovery.validatedRepairWords(timed, repairStart: 0, repairDuration: 5, ownedGap: 0..<5)
+        #expect(kept.count == words.count)
+    }
+
     @Test("An interior acoustic omission uses exact adjacent word boundaries")
     func interiorSpeechGap() {
         let samples = pcm(seconds: 2, active: [0.1..<0.4, 0.7..<1.1, 1.6..<1.9])

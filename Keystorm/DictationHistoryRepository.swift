@@ -54,8 +54,9 @@ struct DictationHistoryMaintenance: Sendable {
 /// Borrows the single catalog connection owned by SessionStore. Version 3 adds
 /// disposable take headers, not another source of recording or audio authority.
 /// Version 4 upgrades early version 3 catalogs whose headers lacked a source count.
+/// Version 5 requires readers to replay the typed transcription entries in the journal.
 struct DictationHistoryRepository {
-    static let catalogVersion: Int32 = 4
+    static let catalogVersion: Int32 = 5
     static let maximumPageSize = 100
     private static let validTakeIdentity = "length(d.take_id)=36 AND substr(d.take_id,9,1)='-' AND substr(d.take_id,14,1)='-' AND substr(d.take_id,19,1)='-' AND substr(d.take_id,24,1)='-' AND length(replace(d.take_id,'-',''))=32 AND replace(d.take_id,'-','') NOT GLOB '*[^0-9A-Fa-f]*'"
     enum FaultPoint { case migrationBeforeCommit }
@@ -127,7 +128,7 @@ struct DictationHistoryRepository {
                     """)
                 try bumpGeneration()
             }
-            try execute("PRAGMA user_version=4")
+            try execute("PRAGMA user_version=5")
             try fault?(.migrationBeforeCommit)
             try execute("COMMIT")
         } catch { try? execute("ROLLBACK"); throw error }
@@ -141,6 +142,8 @@ struct DictationHistoryRepository {
             throw failure("History indexing requires its checkpoint transaction.")
         }
         try execute("DELETE FROM dictation_history WHERE session_id=?", [.text(session.id.uuidString)])
+        try ensureSearchTable()
+        try execute("DELETE FROM dictation_history_search WHERE session_id=?", [.text(session.id.uuidString)])
         if session.dictation != nil {
             for recording in session.recordings {
                 guard recording.createdAt.timeIntervalSinceReferenceDate.isFinite else { throw failure("Invalid history creation date.") }
@@ -153,6 +156,9 @@ struct DictationHistoryRepository {
                           .text(Self.boundedDisplayText(recording.dictation?.textRevision?.text ?? "", characters: 100, bytes: 1_024)),
                           .real(recording.createdAt.timeIntervalSinceReferenceDate), .text(recording.state.rawValue),
                           .integer(recording.trashedAt == nil && session.trashedAt == nil ? 0 : 1)])
+                try execute("INSERT OR REPLACE INTO dictation_history_search(session_id,take_id,folded) VALUES(?,?,?)",
+                    [.text(session.id.uuidString), .text(recording.id.uuidString),
+                     .text(Self.searchableText(title: title, body: recording.dictation?.textRevision?.text ?? ""))])
             }
         }
         try execute("""
@@ -162,6 +168,116 @@ struct DictationHistoryRepository {
                   .integer(Int64(session.dictation == nil ? 0 : session.recordings.count))])
         try execute("DELETE FROM dictation_history_repairs WHERE session_id=?", [.text(session.id.uuidString)])
         try bumpGeneration()
+    }
+
+    // MARK: Search, deletion and retention
+
+    static let maximumSearchBodyCharacters = 8_192
+
+    /// A derived, disposable table like the rest of this index. It holds case- and diacritic-folded
+    /// text so a search for "uber" finds "Über", which SQLite's ASCII-only LIKE could not. Rows are
+    /// written with each checkpoint; older rows fall back to the stored title and preview.
+    private func ensureSearchTable() throws {
+        try execute("""
+            CREATE TABLE IF NOT EXISTS dictation_history_search (
+                session_id TEXT NOT NULL, take_id TEXT NOT NULL, folded TEXT NOT NULL,
+                PRIMARY KEY(session_id,take_id))
+            """)
+    }
+
+    static func fold(_ value: String) -> String {
+        value.folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: nil)
+    }
+
+    static func searchableText(title: String, body: String) -> String {
+        fold(title + "\n" + String(body.prefix(maximumSearchBodyCharacters)))
+    }
+
+    private static func escapeLike(_ value: String) -> String {
+        value.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "%", with: "\\%")
+            .replacingOccurrences(of: "_", with: "\\_")
+    }
+
+    /// Matches the title, preview and the first 8,192 characters of each saved transcript. Newest first, never paged.
+    func search(_ query: String, limit: Int = 50) throws -> [DictationHistoryHeader] {
+        let folded = Self.fold(query.trimmingCharacters(in: .whitespacesAndNewlines))
+        guard !folded.isEmpty, folded.count <= 256, (1...Self.maximumPageSize).contains(limit) else { return [] }
+        try ensureSearchTable()
+        let pattern = "%" + Self.escapeLike(folded) + "%"
+        let statement = try prepare("""
+            SELECT d.session_id,d.take_id,d.title,d.preview,d.created_at,d.state,
+                   CASE WHEN h.revision>d.revision THEN h.revision ELSE d.revision END
+            FROM dictation_history d JOIN dictation_history_checkpoints c ON c.session_id=d.session_id
+            LEFT JOIN session_history_headers h ON h.session_id=d.session_id
+            LEFT JOIN dictation_history_search s ON s.session_id=d.session_id AND s.take_id=d.take_id
+            WHERE d.trashed=0 AND (\(Self.validTakeIdentity)) AND
+                  ((s.folded IS NOT NULL AND s.folded LIKE ? ESCAPE '\\') OR
+                   (s.folded IS NULL AND (d.title LIKE ? ESCAPE '\\' OR d.preview LIKE ? ESCAPE '\\')))
+            ORDER BY d.created_at DESC,d.take_id DESC,d.session_id DESC LIMIT ?
+            """, [.text(pattern), .text(pattern), .text(pattern), .integer(Int64(limit))])
+        defer { sqlite3_finalize(statement) }
+        var headers: [DictationHistoryHeader] = []
+        while try row(statement) {
+            guard let sessionID = UUID(uuidString: text(statement, 0)), let takeID = UUID(uuidString: text(statement, 1)),
+                  let state = DictationRecordingState(rawValue: text(statement, 5)) else { continue }
+            let date = sqlite3_column_double(statement, 4)
+            let revision = sqlite3_column_int64(statement, 6)
+            guard date.isFinite, revision > 0 else { continue }
+            headers.append(.init(id: takeID, sessionID: sessionID,
+                title: Self.boundedDisplayText(text(statement, 2), characters: 160, bytes: 2_048),
+                preview: Self.boundedDisplayText(text(statement, 3), characters: 100, bytes: 1_024),
+                createdAt: Date(timeIntervalSinceReferenceDate: date), state: state, revision: revision))
+        }
+        return headers
+    }
+
+    /// Removes every index row of one session. It runs inside the catalog's deletion transaction, so a
+    /// failure leaves the index and the session payload together.
+    func forgetSession(_ id: UUID) throws {
+        guard sqlite3_get_autocommit(connection) == 0 else {
+            throw failure("History deletion requires its catalog transaction.")
+        }
+        try ensureSearchTable()
+        for table in ["dictation_history", "dictation_history_search", "dictation_history_checkpoints", "dictation_history_repairs"] {
+            try execute("DELETE FROM \(table) WHERE session_id=?", [.text(id.uuidString)])
+        }
+        try bumpGeneration()
+    }
+
+    /// Sessions that own at least one indexed dictation, newest first. Developer briefs never appear.
+    func dictationSessionIDs(limit: Int = 500) throws -> [UUID] {
+        try sessionIDs("""
+            SELECT d.session_id FROM dictation_history d
+            GROUP BY d.session_id ORDER BY max(d.created_at) DESC LIMIT ?
+            """, [.integer(Int64(limit))])
+    }
+
+    /// Finished sessions whose newest dictation is older than `cutoff`. A recording, paused, captured or
+    /// processing take, or a session still marked as capturing, is never returned. With `readyOnly`
+    /// every take must also be Ready, which is what discarding audio needs.
+    func finishedSessionIDs(newestBefore cutoff: Date, readyOnly: Bool = false, limit: Int = 200) throws -> [UUID] {
+        guard cutoff.timeIntervalSinceReferenceDate.isFinite else { return [] }
+        return try sessionIDs("""
+            SELECT d.session_id FROM dictation_history d
+            JOIN dictation_history_checkpoints c ON c.session_id=d.session_id
+            WHERE c.status<>'recording'
+            GROUP BY d.session_id
+            HAVING max(d.created_at)<? AND
+                   sum(CASE WHEN d.state IN ('recording','paused','captured','processing') THEN 1 ELSE 0 END)=0 AND
+                   (?=0 OR sum(CASE WHEN d.state<>'ready' THEN 1 ELSE 0 END)=0)
+            ORDER BY min(d.created_at) LIMIT ?
+            """, [.real(cutoff.timeIntervalSinceReferenceDate), .integer(readyOnly ? 1 : 0), .integer(Int64(limit))])
+    }
+
+    private func sessionIDs(_ sql: String, _ values: [Value]) throws -> [UUID] {
+        let statement = try prepare(sql, values)
+        defer { sqlite3_finalize(statement) }
+        var result: [UUID] = []
+        while try row(statement) {
+            if let id = UUID(uuidString: text(statement, 0)) { result.append(id) }
+        }
+        return result
     }
 
     /// Called after a capture tail commits. The live journal header supplies its

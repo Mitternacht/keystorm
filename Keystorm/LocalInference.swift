@@ -24,6 +24,8 @@ nonisolated struct SpeechWindowResult: Codable, Sendable {
 /// Networking is confined to install(). Inference loads only app-managed local files.
 actor LocalInference {
     nonisolated static let speechTokenLimit = 150
+    /// Longest transcription window, in seconds of persisted audio, a single job may decode.
+    nonisolated static let maximumWindowSeconds = 15.0
     /// Below this headroom the inactive model leaves before the requested one loads.
     private nonisolated static let coexistenceReserve = 1536 * 1_024 * 1_024
     private let modelDirectory: URL
@@ -31,16 +33,30 @@ actor LocalInference {
     private var speechID: String?
     private var text: ModelContainer?
     private var grammarCache: LocalGrammarCache?
+    private let textPrefixCache = LocalTextPrefixCache()
+    private let textPrefixReuseEnabled: Bool
+    private let sourceDraftEnabled: Bool
+    private(set) var lastTransformPromptSHA256: String?
+    private var lastTransformMetrics: [String: UInt64] = [:]
     private var operationInProgress = false
     private var memoryCeiling = 6 * 1024 * 1024 * 1024
     private var verifiedFingerprints: [String: [String]] = [:]
     private(set) var integrityVerificationCount = 0
+    /// Verifications satisfied by the persisted record instead of reading and hashing the files.
+    private(set) var integrityCacheHitCount = 0
+    private let integrityStore: ModelIntegrityStore
     private var speechModelLoads: UInt64 = 0
     private var textModelLoads: UInt64 = 0
     private var speechModelLoadMicroseconds: UInt64 = 0
     private var textModelLoadMicroseconds: UInt64 = 0
 
-    init(modelDirectory: URL) { self.modelDirectory = modelDirectory }
+    /// The default enables prefix reuse; qualification can compare the full-prefill path.
+    init(modelDirectory: URL, textPrefixReuseEnabled: Bool = true, sourceDraftEnabled: Bool = true) {
+        self.modelDirectory = modelDirectory
+        self.textPrefixReuseEnabled = textPrefixReuseEnabled
+        self.sourceDraftEnabled = sourceDraftEnabled
+        integrityStore = ModelIntegrityStore(modelDirectory: modelDirectory)
+    }
 
     /// The worker subtracts the parent process footprint from the shared Mac budget.
     func setMemoryCeiling(_ bytes: Int) throws {
@@ -179,6 +195,11 @@ actor LocalInference {
         }
         if hadPrevious { try? FileManager.default.removeItem(at: backup) }
         verifiedFingerprints[model.id] = try artifactFingerprint(model, at: destination)
+        // Every artifact was hashed against the catalog above, and renaming the folder leaves
+        // each file's own identity unchanged, so the first launch after an install is warm too.
+        if let identities = try? artifactIdentities(model, at: destination) {
+            integrityStore.remember(identities, expectedSHA256: model.artifacts.map(\.sha256))
+        }
         progress(1)
         return configuration
     }
@@ -187,7 +208,23 @@ actor LocalInference {
         try await transcribeWindow(segments: segments, directory: audioDirectory, model: model).transcript
     }
 
-    func transcribeWindow(segments: [AudioSegment], directory audioDirectory: URL, model: ModelDescriptor) async throws -> SpeechWindowResult {
+    /// How far a window may run over the 15 s cap before a whole neighbouring segment is dropped. The overshoot is
+    /// trimmed from the context segments' outer edges instead. Capture rotates segments after the buffer that reaches
+    /// 5 s, so real segments run a little long, and three of them must not lose their context for that.
+    nonisolated static let maximumTrimmedOvershoot = 1.0
+
+    /// How many samples come off the left and right context edges to remove `excess`, split evenly and never more
+    /// than a side has. The two add up to `excess` when the contexts can absorb it, and fall short when they cannot.
+    nonisolated static func contextTrim(excess: Int, leftContext: Int, rightContext: Int) -> (left: Int, right: Int) {
+        guard excess > 0 else { return (0, 0) }
+        var left = min(leftContext, (excess + 1) / 2)
+        let right = min(rightContext, excess - left)
+        left = min(leftContext, excess - right)
+        return (left, right)
+    }
+
+    func transcribeWindow(segments: [AudioSegment], directory audioDirectory: URL, model: ModelDescriptor,
+                          coreSegmentID: UUID? = nil) async throws -> SpeechWindowResult {
         guard !operationInProgress else { throw failure("Another inference operation is still finishing.") }
         operationInProgress = true
         defer { operationInProgress = false }
@@ -197,7 +234,7 @@ actor LocalInference {
         let configuration = try configuration(for: model)
         let ordered = segments.sorted { $0.startTime < $1.startTime }
         guard let first = ordered.first, let last = ordered.last,
-              ordered.reduce(0, { $0 + $1.duration }) <= 15.001 else {
+              ordered.reduce(0, { $0 + $1.duration }) <= Self.maximumWindowSeconds + Self.maximumTrimmedOvershoot + 0.001 else {
             throw failure("Transcription jobs must contain at most 15 seconds of persisted audio.")
         }
         for (left, right) in zip(ordered, ordered.dropFirst()) {
@@ -209,6 +246,7 @@ actor LocalInference {
         let converter = AudioConverter(sampleRate: 16_000)
         var samples: [Float] = []
         samples.reserveCapacity(240_000)
+        var segmentSampleCounts: [Int] = []
         for segment in ordered {
             try Task.checkCancellation()
             guard segment.fileName == URL(fileURLWithPath: segment.fileName).lastPathComponent else {
@@ -216,9 +254,29 @@ actor LocalInference {
             }
             let url = audioDirectory.appendingPathComponent(segment.fileName)
             guard try Self.sha256(url) == segment.sha256 else { throw failure("Audio checksum mismatch. Original audio was not modified.") }
+            let before = samples.count
             samples.append(contentsOf: try converter.resampleAudioFile(url))
+            segmentSampleCounts.append(samples.count - before)
         }
-        guard samples.count <= 240_000 else { throw failure("The audio window exceeds the bounded 15-second job limit.") }
+        // A window over the 240_000-sample cap (resampling rounding, or segments that ran slightly past 5 s) sheds
+        // the excess from the outer edges of its context segments, never from the segment whose words are kept.
+        // Without a known core, only a few samples of rounding come off the tail, as before.
+        var leadingTrim = 0
+        if samples.count > 240_000 {
+            let excess = samples.count - 240_000
+            var left = 0, right = 0
+            if let coreSegmentID, ordered.count > 1 {
+                let leftContext = ordered.first?.id == coreSegmentID ? 0 : (segmentSampleCounts.first ?? 0)
+                let rightContext = ordered.last?.id == coreSegmentID ? 0 : (segmentSampleCounts.last ?? 0)
+                (left, right) = Self.contextTrim(excess: excess, leftContext: leftContext, rightContext: rightContext)
+            } else {
+                right = min(excess, 1_600)
+            }
+            guard left + right == excess else { throw failure("The audio window exceeds the bounded 15-second job limit.") }
+            if right > 0 { samples.removeLast(right) }
+            if left > 0 { samples.removeFirst(left) }
+            leadingTrim = left
+        }
         guard samples.allSatisfy(\.isFinite) else { throw failure("The saved audio contains invalid samples.") }
         var state = try TdtDecoderState()
         let result = try await speech.transcribe(samples, decoderState: &state)
@@ -269,9 +327,9 @@ actor LocalInference {
                                   segmentIDs: ordered.map(\.id), startTime: first.startTime,
                                   endTime: last.endTime, timingPrecision: .window,
                                   configurationID: configuration.id, isComplete: complete)
+        let origin = first.startTime + Double(leadingTrim) / 16_000
         let words = relativeWords.map {
-            TimedSpeechWord(word: $0.word, startTime: first.startTime + $0.startTime,
-                            endTime: first.startTime + $0.endTime)
+            TimedSpeechWord(word: $0.word, startTime: origin + $0.startTime, endTime: origin + $0.endTime)
         }
         return SpeechWindowResult(transcript: transcript, words: words)
     }
@@ -370,16 +428,17 @@ actor LocalInference {
         let text = try await loadedText()
         let grammar = try await grammarResources(in: text)
         let system = DictationTransformPolicy.systemPrompt(for: request.mode, context: request.context)
+        let prefixCache = textPrefixCache
+        let prefixReuseEnabled = textPrefixReuseEnabled
+        let useSourceDrafts = sourceDraftEnabled
+        let sourceDraftMemoryCeiling = UInt64(max(0, memoryCeiling))
+        // Reserve room for both the immutable snapshot and the job's independent copy.
+        let availablePrefixBytes = max(0, memoryCeiling - Int(Self.processFootprint()) - 256 * 1_024 * 1_024)
+        let prefixByteLimit = UInt64(min(Int(LocalTextPrefixCache.maximumRetainedBytes), availablePrefixBytes / 2))
         // JSON escaping establishes an unambiguous data boundary. Only the fixed
         // system prompt defines behavior; dictated instructions remain source text.
-        struct ModelPayload: Encodable {
-            var source: String
-            var language_policy: String
-            var context: [String: String]?
-        }
-        let sourceData = try JSONEncoder().encode(ModelPayload(source: request.sourceText,
-            language_policy: request.languagePolicy.rawValue, context: request.context?.modelData))
-        let sourceMessage = String(decoding: sourceData, as: UTF8.self)
+        let sourceMessage = try Self.transformUserMessage(source: request.sourceText,
+            languagePolicy: request.languagePolicy, context: request.context?.modelData)
         let generated = try await text.perform { modelContext in
             let messages: [[String: any Sendable]] = [
                 ["role": "system", "content": system],
@@ -391,34 +450,104 @@ actor LocalInference {
                 throw KeystormError.message("This passage exceeds the local transform input limit. The original is saved; select a smaller passage.")
             }
             try Task.checkCancellation()
+            let preparationStarted = ContinuousClock.now
             let input = try await modelContext.processor.prepare(input: UserInput(
                 messages: messages, additionalContext: ["enable_thinking": false]))
-            let constraint = try grammar.constraint(for: .dictationTransform)
-            let outputLimit = min(config.outputLimit, 2048)
-            var output = ""
-            var outputByteCount = 0
-            var exceededEnvelopeLimit = false
-            let maximumEnvelopeBytes = DictationTransformPolicy.maxOutputUTF8 * 6 + 1024
-            let count = try GuidedGenerationLoop.run(input: input, context: modelContext,
-                constraint: constraint, maxTokens: outputLimit, vocabSize: grammar.tokenizer.vocabSize,
-                completionReserve: 0) { delta in
-                    let deltaBytes = delta.utf8.count
-                    guard outputByteCount + deltaBytes <= maximumEnvelopeBytes else {
-                        exceededEnvelopeLimit = true
-                        return false
+            var promptSHA256: String?
+            #if DEBUG
+            let promptBytes = input.text.tokens.asArray(Int32.self).withUnsafeBytes { Data($0) }
+            promptSHA256 = SHA256.hash(data: promptBytes).map { String(format: "%02x", $0) }.joined()
+            #endif
+            var generationContext = modelContext
+            var generationInput = input
+            var reusedPrefix = false
+            // The pinned template requires a user message. An empty user probe shares only
+            // the fixed system prompt and role delimiter with the real prepared payload;
+            // comparing actual tokens avoids guessing delimiters or retaining dictated text.
+            if prefixReuseEnabled {
+                do {
+                    let fixedTokens = try modelContext.tokenizer.applyChatTemplate(
+                        messages: [["role": "system", "content": system],
+                                   ["role": "user", "content": ""]], tools: nil,
+                        additionalContext: ["enable_thinking": false])
+                    if let prepared = try prefixCache.prepare(input, systemTokens: fixedTokens,
+                        model: modelContext.model, maximumBytes: prefixByteLimit) {
+                        generationContext.model = prepared.model
+                        generationInput = prepared.input
+                        reusedPrefix = true
                     }
-                    outputByteCount += deltaBytes
-                    output += delta
-                    return !Task.isCancelled
+                } catch is CancellationError { throw CancellationError() }
+                catch {
+                    prefixCache.recordPreparationFailure()
+                    prefixCache.clear() // Optional caching falls back to a fresh full prefill.
                 }
-            try Task.checkCancellation()
-            guard !exceededEnvelopeLimit, count < outputLimit else {
-                throw DictationTransformGenerationFailure(
-                    message: "The transform reached its output limit. No partial rewrite was applied; the original is saved.",
-                    generatedEnvelope: output, generatedTokens: count)
             }
-            return (output, count)
+            let outputLimit = min(config.outputLimit, 2048)
+            let maximumEnvelopeBytes = DictationTransformPolicy.maxOutputUTF8 * 6 + 1024
+            // Measure headroom after prefix preparation: the retained snapshot is already resident.
+            let memory = MLX.Memory.snapshot()
+            let decision = LocalCleanGeneration.eligibility(.init(enabled: useSourceDrafts,
+                mode: request.mode, hasContext: request.context != nil,
+                pinnedQwen: config.modelID == "qwen35-4b-4bit"
+                    && config.revision == "32f3e8ecf65426fc3306969496342d504bfa13f3"
+                    && (modelContext.model is Qwen35Model || modelContext.model is Qwen35TextModel),
+                fullPromptTokens: tokens.count, sourceUTF8Bytes: request.sourceText.utf8.count,
+                prefixReused: reusedPrefix, uncachedTokens: generationInput.text.tokens.size,
+                memoryCeiling: sourceDraftMemoryCeiling, processFootprint: Self.processFootprint(),
+                mlxBytes: UInt64(memory.activeMemory) + UInt64(memory.cacheMemory)))
+            let contextForGeneration = generationContext
+            let inputForGeneration = generationInput
+            let candidate: LocalCleanGeneration.Operation?
+            if decision == .eligible {
+                let drafts = try SourceDraftGeneration.Drafts(source: request.sourceText,
+                    tokenizer: modelContext.tokenizer)
+                candidate = { constraint, attempt in
+                    let result = try SourceDraftGeneration.run(input: inputForGeneration,
+                        context: contextForGeneration, constraint: constraint, maxTokens: outputLimit,
+                        vocabSize: grammar.tokenizer.vocabSize, drafts: drafts, maximumDraftTokens: 16,
+                        stopDraftingAfterRejection: true, measurePhases: false,
+                        recordToken: { _, _ in attempt.recordGeneratedToken() }, emit: attempt.emit)
+                    return LocalCleanGeneration.LoopResult(generatedTokens: result.generatedTokens,
+                        acceptedTokens: result.acceptedTokens, counters: result.counters)
+                }
+            } else {
+                candidate = nil
+            }
+            let preparationMicroseconds = Self.microseconds(preparationStarted.duration(to: .now))
+            let outcome = try LocalCleanGeneration.run(grammar: grammar, outputLimit: outputLimit,
+                maximumEnvelopeBytes: maximumEnvelopeBytes, candidate: candidate) { constraint, attempt in
+                let count = try GuidedGenerationLoop.run(input: inputForGeneration, context: contextForGeneration,
+                    constraint: constraint, maxTokens: outputLimit, vocabSize: grammar.tokenizer.vocabSize,
+                    completionReserve: 0, emit: attempt.emit)
+                // The pinned upstream loop observes terminal EOS without committing it.
+                return LocalCleanGeneration.LoopResult(generatedTokens: count, acceptedTokens: count)
+            }
+            var metrics: [String: UInt64] = [
+                "transformPreparationMicroseconds": preparationMicroseconds,
+                "transformFirstDeltaMicroseconds": outcome.firstDeltaMicroseconds ?? 0,
+                "transformGenerationMicroseconds": outcome.generationMicroseconds,
+                "transformGeneratedTokens": UInt64(outcome.generatedTokens),
+                "transformInputTokens": UInt64(tokens.count),
+                "transformUncachedInputTokens": UInt64(generationInput.text.tokens.size),
+                "transformSourceDraftEligibility": decision.rawValue,
+                "transformSourceDraftUsed": outcome.usedCandidate ? 1 : 0,
+                "transformGenerationAttempts": UInt64(outcome.attemptCount),
+                "transformSourceDraftFallback": outcome.fallbackReason.rawValue
+            ]
+            if let counters = outcome.counters {
+                metrics["transformSourceDraftRounds"] = UInt64(counters.draftRounds)
+                metrics["transformSourceDraftProposedTokens"] = UInt64(counters.proposedTokens)
+                metrics["transformSourceDraftVerifiedTokens"] = UInt64(counters.verifiedDraftTokens)
+                metrics["transformSourceDraftRejectedRounds"] = UInt64(counters.rejectedRounds)
+                metrics["transformSourceDraftStoppedAfterRejection"] = counters.draftingStoppedAfterRejection ? 1 : 0
+                metrics["transformSourceDraftSerialTokensAfterCutoff"] = UInt64(counters.serialTokensAfterCutoff)
+                metrics["transformSourceDraftPeakObservedCacheBackingBytes"] = counters.peakObservedCacheBackingBytes
+                metrics["transformSourceDraftPeakCombinedObservedCacheBackingBytes"] = counters.peakCombinedObservedCacheBackingBytes
+            }
+            return (outcome.envelope, outcome.generatedTokens, promptSHA256, metrics)
         }
+        lastTransformPromptSHA256 = generated.2
+        lastTransformMetrics = generated.3
         MLX.Memory.clearCache()
         try Task.checkCancellation()
         try checkMemoryHeadroom()
@@ -439,6 +568,21 @@ actor LocalInference {
             throw DictationTransformGenerationFailure(message: String(error.localizedDescription.prefix(2048)),
                 generatedEnvelope: generated.0, generatedTokens: generated.1)
         }
+    }
+
+    /// Preserve source-first prompt order without depending on JSONEncoder's object-key order.
+    /// Each value is still JSON encoded, so dictated quotes or braces cannot escape the data field.
+    nonisolated static func transformUserMessage(source: String, languagePolicy: DictationLanguagePolicy,
+                                                context: [String: String]? = nil) throws -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        func value<T: Encodable>(_ value: T) throws -> String {
+            String(decoding: try encoder.encode(value), as: UTF8.self)
+        }
+        var fields = ["\"source\":" + (try value(source)),
+                      "\"language_policy\":" + (try value(languagePolicy.rawValue))]
+        if let context { fields.append("\"context\":" + (try value(context))) }
+        return "{" + fields.joined(separator: ",") + "}"
     }
 
     /// Shared checks run before model/worker startup and again inside the worker.
@@ -521,23 +665,24 @@ actor LocalInference {
             }
             let input = try await context.processor.prepare(input: UserInput(messages: messages,
                 additionalContext: ["enable_thinking": false]))
-            let matcher = try grammar.constraint(for: .correctionClassification)
-            var output = ""
-            var byteCount = 0
-            var exceeded = false
-            let count = try GuidedGenerationLoop.run(input: input, context: context,
-                constraint: matcher, maxTokens: outputLimit, vocabSize: grammar.tokenizer.vocabSize,
-                completionReserve: 0) { delta in
-                    guard byteCount + delta.utf8.count <= 4096 else { exceeded = true; return false }
-                    byteCount += delta.utf8.count
-                    output += delta
-                    return !Task.isCancelled
+            return try grammar.withConstraint(for: .correctionClassification) { matcher in
+                var output = ""
+                var byteCount = 0
+                var exceeded = false
+                let count = try GuidedGenerationLoop.run(input: input, context: context,
+                    constraint: matcher, maxTokens: outputLimit, vocabSize: grammar.tokenizer.vocabSize,
+                    completionReserve: 0) { delta in
+                        guard byteCount + delta.utf8.count <= 4096 else { exceeded = true; return false }
+                        byteCount += delta.utf8.count
+                        output += delta
+                        return !Task.isCancelled
+                    }
+                try Task.checkCancellation()
+                guard !exceeded, count > 0, count < outputLimit else {
+                    throw CorrectionLearningError.invalidClassification
                 }
-            try Task.checkCancellation()
-            guard !exceeded, count > 0, count < outputLimit else {
-                throw CorrectionLearningError.invalidClassification
+                return (value: (output, count), acceptedTokens: count)
             }
-            return (output, count)
         }
         MLX.Memory.clearCache()
         try Task.checkCancellation()
@@ -620,22 +765,23 @@ actor LocalInference {
                         throw KeystormError.message("The source exceeds the bounded extraction input. Retry a smaller section.")
                     }
                     let grammarTokenizer = grammar.tokenizer
-                    let constraint = try grammar.constraint(for: .extraction)
-                    var output = ""
-                    // Each call creates fresh attention AND recurrent/convolution state.
-                    // No closing bias: output caps must surface as incomplete, never force a short JSON success.
-                    let generatedTokenCount = try GuidedGenerationLoop.run(input: input, context: modelContext, constraint: constraint,
-                        maxTokens: config.outputLimit, vocabSize: grammarTokenizer.vocabSize,
-                        completionReserve: 0) { delta in
-                        output += delta
-                        return !Task.isCancelled
+                    return try grammar.withConstraint(for: .extraction) { constraint in
+                        var output = ""
+                        // Each call creates fresh attention AND recurrent/convolution state.
+                        // No closing bias: output caps must surface as incomplete, never force a short JSON success.
+                        let generatedTokenCount = try GuidedGenerationLoop.run(input: input, context: modelContext, constraint: constraint,
+                            maxTokens: config.outputLimit, vocabSize: grammarTokenizer.vocabSize,
+                            completionReserve: 0) { delta in
+                            output += delta
+                            return !Task.isCancelled
+                        }
+                        try Task.checkCancellation()
+                        // Reject exact-cap results even if the grammar closed valid JSON on its last token.
+                        guard generatedTokenCount < config.outputLimit else {
+                            throw KeystormError.message("Extraction reached its output limit. Retry a smaller source section.")
+                        }
+                        return (value: output, acceptedTokens: generatedTokenCount)
                     }
-                    try Task.checkCancellation()
-                    // Reject exact-cap results even if the grammar closed valid JSON on its last token.
-                    guard generatedTokenCount < config.outputLimit else {
-                        throw KeystormError.message("Extraction reached its output limit. Retry a smaller source section.")
-                    }
-                    return output
                 }
                 let envelope = try JSONDecoder().decode(ExtractionEnvelope.self, from: Data(output.utf8))
                 guard envelope.complete else { throw failure("The model reported incomplete extraction. Retry a smaller section.") }
@@ -703,16 +849,17 @@ actor LocalInference {
             let input = try await modelContext.processor.prepare(input: UserInput(messages: messages,
                 additionalContext: ["enable_thinking": false]))
             let grammarTokenizer = grammar.tokenizer
-            let constraint = try grammar.constraint(for: .edit)
-            var result = ""
-            let count = try GuidedGenerationLoop.run(input: input, context: modelContext, constraint: constraint,
-                maxTokens: min(config.outputLimit, 1536), vocabSize: grammarTokenizer.vocabSize,
-                completionReserve: 0) { delta in result += delta; return !Task.isCancelled }
-            try Task.checkCancellation()
-            guard count < min(config.outputLimit, 1536) else {
-                throw KeystormError.message("The edit reached its output cap. No partial change was applied.")
+            return try grammar.withConstraint(for: .edit) { constraint in
+                var result = ""
+                let count = try GuidedGenerationLoop.run(input: input, context: modelContext, constraint: constraint,
+                    maxTokens: min(config.outputLimit, 1536), vocabSize: grammarTokenizer.vocabSize,
+                    completionReserve: 0) { delta in result += delta; return !Task.isCancelled }
+                try Task.checkCancellation()
+                guard count < min(config.outputLimit, 1536) else {
+                    throw KeystormError.message("The edit reached its output cap. No partial change was applied.")
+                }
+                return (value: result, acceptedTokens: count)
             }
-            return result
         }
         MLX.Memory.clearCache()
         let envelope = try JSONDecoder().decode(BriefEditEnvelope.self, from: Data(output.utf8))
@@ -782,7 +929,41 @@ actor LocalInference {
             }
         }
         let container = try await loadedText()
-        _ = try await grammarResources(in: container)
+        let grammar = try await grammarResources(in: container)
+        // Compile the Clean/Email schema now, off the Finish path. A failure here is not the
+        // warm-up's to report: the transform compiles it again and surfaces any real error.
+        try? grammar.prime(.dictationTransform)
+        if textPrefixReuseEnabled,
+           textPrefixCache.statistics()["textModelPrefixRetainedBytes", default: 0] == 0 {
+            // The first default Clean should not build its fixed prefix on Finish.
+            // No generation occurs, and only exact shared system/role tokens are
+            // retained. Existing prefixes for Email or contextual modes stay intact.
+            let system = DictationTransformPolicy.systemPrompt(for: .clean, context: nil)
+            let sourceMessage = try Self.transformUserMessage(source: "", languagePolicy: .mixedEnglishGerman)
+            let availableBytes = max(0, memoryCeiling - Int(Self.processFootprint()) - 256 * 1_024 * 1_024)
+            let maximumBytes = UInt64(min(Int(LocalTextPrefixCache.maximumRetainedBytes), availableBytes / 2))
+            let prefixCache = textPrefixCache
+            do {
+                try await container.perform { context in
+                    let messages: [[String: any Sendable]] = [
+                        ["role": "system", "content": system],
+                        ["role": "user", "content": sourceMessage]
+                    ]
+                    let input = try await context.processor.prepare(input: UserInput(
+                        messages: messages, additionalContext: ["enable_thinking": false]))
+                    let fixedTokens = try context.tokenizer.applyChatTemplate(
+                        messages: [["role": "system", "content": system],
+                                   ["role": "user", "content": ""]], tools: nil,
+                        additionalContext: ["enable_thinking": false])
+                    _ = try prefixCache.prepare(input, systemTokens: fixedTokens,
+                        model: context.model, maximumBytes: maximumBytes)
+                }
+            } catch is CancellationError { throw CancellationError() }
+            catch {
+                prefixCache.recordPreparationFailure()
+                prefixCache.clear() // Optional reuse falls back to foreground preparation.
+            }
+        }
         try Task.checkCancellation()
         try checkMemoryHeadroom()
     }
@@ -836,6 +1017,7 @@ actor LocalInference {
     }
 
     func releaseText() async {
+        textPrefixCache.clear()
         grammarCache = nil
         text = nil
         MLX.Memory.clearCache()
@@ -863,13 +1045,28 @@ actor LocalInference {
         }
     }
 
-    /// Full hashes are checked once per process/install, then when file identity or
+    /// Full hashes are checked once per install, then only when file identity or
     /// nanosecond modification/change metadata changes. Window dispatch does only stat calls.
+    /// A new process first consults the persisted record of earlier verifications, which holds
+    /// only while every file still has the exact identity it was hashed with (see
+    /// `ModelIntegrityStore`). `force` always hashes, because it is the explicit repair check.
+    /// Returns true when the artifacts were (re)verified, so callers reload resident models.
     @discardableResult
     func verifyArtifacts(_ model: ModelDescriptor, at directory: URL, force: Bool = false) throws -> Bool {
         let fingerprint = try artifactFingerprint(model, at: directory)
         if !force, verifiedFingerprints[model.id] == fingerprint { return false }
         verifiedFingerprints.removeValue(forKey: model.id)
+        let identities = try artifactIdentities(model, at: directory)
+        let expected = model.artifacts.map(\.sha256)
+        if !force, integrityStore.confirms(identities, expectedSHA256: expected) {
+            // The records matched the identities read above; confirm nothing moved since.
+            guard try artifactFingerprint(model, at: directory) == fingerprint else {
+                throw failure("Model artifacts changed during verification. Retry after installation finishes.")
+            }
+            verifiedFingerprints[model.id] = fingerprint
+            integrityCacheHitCount += 1
+            return true
+        }
         for artifact in model.artifacts {
             try Task.checkCancellation()
             guard try Self.sha256(directory.appendingPathComponent(artifact.path)) == artifact.sha256 else {
@@ -881,7 +1078,20 @@ actor LocalInference {
         }
         verifiedFingerprints[model.id] = fingerprint
         integrityVerificationCount += 1
+        integrityStore.remember(identities, expectedSHA256: expected)
         return true
+    }
+
+    /// The persisted-record key for each artifact, in catalog order. Throws like the fingerprint
+    /// for a missing, non-regular or wrongly sized file, so a size change never reaches the cache.
+    private func artifactIdentities(_ model: ModelDescriptor, at directory: URL) throws -> [ModelFileIdentity] {
+        try model.artifacts.map { artifact in
+            guard let identity = ModelFileIdentity.current(at: directory.appendingPathComponent(artifact.path)),
+                  identity.size == artifact.bytes else {
+                throw failure("An installed model file is missing or changed. Reinstall \(model.displayName).")
+            }
+            return identity
+        }
     }
 
     private func artifactFingerprint(_ model: ModelDescriptor, at directory: URL) throws -> [String] {
@@ -904,8 +1114,11 @@ actor LocalInference {
                 "speechModelLoaded": speech == nil ? 0 : 1, "textModelLoaded": text == nil ? 0 : 1,
                 "speechModelLoads": speechModelLoads, "textModelLoads": textModelLoads,
                 "speechModelLoadMicroseconds": speechModelLoadMicroseconds,
-                "textModelLoadMicroseconds": textModelLoadMicroseconds]
+                "textModelLoadMicroseconds": textModelLoadMicroseconds,
+                "integrityCacheHits": UInt64(integrityCacheHitCount)]
         measurements.merge(grammarCache?.statistics() ?? [:]) { _, new in new }
+        measurements.merge(textPrefixCache.statistics()) { _, new in new }
+        measurements.merge(lastTransformMetrics) { _, new in new }
         return measurements
     }
 
@@ -1198,7 +1411,8 @@ nonisolated struct ExtractionEnvelope: Decodable, Sendable {
     """
 }
 
-private nonisolated struct LocalTokenizerLoader: TokenizerLoader {
+/// Shared with the opt-in Release harness so comparisons use the production chat template.
+nonisolated struct LocalTokenizerLoader: TokenizerLoader {
     func load(from directory: URL) async throws -> any MLXLMCommon.Tokenizer {
         let tokenizer = try await AutoTokenizer.from(modelFolder: directory)
         let template = try String(contentsOf: directory.appendingPathComponent("chat_template.jinja"), encoding: .utf8)

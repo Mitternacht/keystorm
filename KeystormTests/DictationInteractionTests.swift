@@ -263,6 +263,8 @@ private struct InteractionRig {
             .appendingPathComponent("Keystorm-Interaction-" + UUID().uuidString))
         flow = DictationCoordinator(backend: backend,
             delivery: DictationDeliveryService(adapter: InteractionUntrustedAdapter()))
+        // Keeps the user's clipboard untouched; Copy when not inserted is covered in DictationCoordinatorTests.
+        flow.preferences.copyWhenNotInserted = false
         controller.configure(workspace: workspace, showWorkspace: {}, dictation: flow,
                              legacyRecording: legacy, startShortcuts: false)
     }

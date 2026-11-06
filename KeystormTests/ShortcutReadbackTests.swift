@@ -57,13 +57,14 @@ struct ShortcutReadbackTests {
         let defaults = try #require(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         let manager = ShortcutManager(defaults: defaults)
-        let record = try #require(manager.shortcut(for: .toggleRecording))
-        #expect(throws: ShortcutError.duplicate(ShortcutAction.toggleRecording.title)) {
-            try manager.setShortcut(record, for: .readSection)
+        // A fresh install binds no developer-brief shortcut, so the duplicate comes from a default that remains.
+        let workspace = try #require(manager.shortcut(for: .showWorkspace))
+        #expect(throws: ShortcutError.duplicate(ShortcutAction.showWorkspace.title)) {
+            try manager.setShortcut(workspace, for: .readSection)
         }
         #expect(manager.shortcut(for: .readSection) == nil)
-        try manager.setShortcut(nil, for: .toggleRecording)
-        #expect(ShortcutManager(defaults: defaults).shortcut(for: .toggleRecording) == nil)
+        try manager.setShortcut(nil, for: .showWorkspace)
+        #expect(ShortcutManager(defaults: defaults).shortcut(for: .showWorkspace) == nil)
     }
 
     @Test func repeatsRequireAReleaseBeforeAnotherDispatch() {

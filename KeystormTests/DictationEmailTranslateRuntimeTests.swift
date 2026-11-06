@@ -18,6 +18,7 @@ struct DictationEmailTranslateRuntimeTests {
 
     @Test("Installed Qwen formats the Müller Email example and translates short EN/DE fixtures",
           .enabled(if: ProcessInfo.processInfo.environment["KEYSTORM_RUN_DICTATION_TRANSFORM"] == "1"),
+          .exclusiveModelUse,
           .timeLimit(.minutes(10)))
     func installedModelEmailAndTranslation() async throws {
         let models = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,

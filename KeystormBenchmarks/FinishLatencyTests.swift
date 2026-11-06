@@ -1,3 +1,4 @@
+import AppKit
 import AVFoundation
 import Foundation
 import Testing
@@ -13,26 +14,26 @@ import os
 /// transcription (raw), Clean, and the in-process delivery step against an in-memory field.
 /// No microphone, download, network, real Accessibility target or clipboard is used.
 @MainActor
-@Suite(.serialized)
+@Suite(.serialized, .exclusiveBenchmarkUse)
 struct FinishLatencyTests {
     @Test("File-fed Finish passes are timed against the engineering budgets",
           .enabled(if: ProcessInfo.processInfo.environment["KEYSTORM_RUN_FINISH_LATENCY"] == "1"),
           .timeLimit(.minutes(120)))
     func finishPassesAgainstBudgets() async throws {
+        try #require(AppLifecycle.bootstrap?.isReady != true,
+            "The global app workspace started inside the benchmark host; this run would be contaminated.")
         let environment = ProcessInfo.processInfo.environment
         let warmPasses = FinishLatencyHarness.passCount(from: environment[FinishLatencyHarness.countVariable])
         let outputURL = FinishLatencyHarness.outputURL(from: environment[FinishLatencyHarness.outputVariable], now: Date())
         let models = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
             appropriateFor: nil, create: false).appendingPathComponent("Keystorm/Models", isDirectory: true)
         let installation = LocalInference(modelDirectory: models)
-        guard await installation.isInstalled(ModelCatalog.primarySpeech) else {
-            try Test.cancel("The pinned local speech model is not installed in \(models.path). Nothing was downloaded.")
-        }
+        try #require(await installation.isInstalled(ModelCatalog.primarySpeech),
+            "The enabled benchmark requires the pinned local speech model in \(models.path). Nothing was downloaded.")
         let textInstalled = await installation.isInstalled(ModelCatalog.primaryText)
-        guard FileManager.default.isExecutableFile(atPath: FinishLatencyHarness.sayPath),
-              FileManager.default.isExecutableFile(atPath: FinishLatencyHarness.afconvertPath) else {
-            try Test.cancel("Local speech synthesis tools are unavailable. No audio was fetched instead.")
-        }
+        try #require(FileManager.default.isExecutableFile(atPath: FinishLatencyHarness.sayPath) &&
+            FileManager.default.isExecutableFile(atPath: FinishLatencyHarness.afconvertPath),
+            "The enabled benchmark requires local speech synthesis tools. No audio was fetched instead.")
         let work = FileManager.default.temporaryDirectory
             .appendingPathComponent("Keystorm-FinishLatency-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
@@ -40,12 +41,17 @@ struct FinishLatencyTests {
         let fixture = try await FinishLatencyHarness.synthesizeFixture(in: work)
         var report = FinishLatencyReport(fixture: fixture.metadata, textModelInstalled: textInstalled,
             requestedWarmPasses: warmPasses)
+        let identity = try BenchmarkArtifactIdentity.capture()
+        report.artifactIdentity = identity
+        report.buildInstrumentation = try BenchmarkBuildInstrumentation.capture(identity: identity)
 
         // Cold: a fresh worker process for one pass, without a prewarm.
         let cold = WorkspaceModel(root: work.appendingPathComponent("ColdStore", isDirectory: true), modelDirectory: models)
         do {
             await cold.initialize(loadLibrary: true)
             try #require(cold.error == nil, "\(cold.error ?? "")")
+            report.resourceSnapshots.append(FinishResourceSnapshot(label: "cold-before-models",
+                measurements: await cold.runtimeResourceSnapshot()))
             report.passes.append(await runPass(index: 0, scenario: .cold, model: cold, audio: fixture.url,
                 measuresClean: textInstalled))
         } catch {
@@ -53,26 +59,53 @@ struct FinishLatencyTests {
             throw error
         }
         await cold.stopForTermination()
+        report.resourceSnapshots.append(FinishResourceSnapshot(label: "cold-worker-stopped",
+            measurements: await cold.runtimeResourceSnapshot()))
 
         // Prewarmed first use, then warm passes, on a second fresh worker process.
         let warm = WorkspaceModel(root: work.appendingPathComponent("WarmStore", isDirectory: true), modelDirectory: models)
         do {
             await warm.initialize(loadLibrary: true)
             try #require(warm.error == nil, "\(warm.error ?? "")")
-            if textInstalled { report.prewarm = await warm.prewarmTextModel() }
+            if textInstalled {
+                report.prewarm = await warm.prewarmTextModel()
+                try #require(report.prewarm?.outcome == .loaded || report.prewarm?.outcome == .alreadyResident,
+                    "The first-use prewarm did not complete successfully.")
+            }
+            report.resourceSnapshots.append(FinishResourceSnapshot(label: "text-prewarmed-before-first-pass",
+                measurements: await warm.runtimeResourceSnapshot()))
             report.passes.append(await runPass(index: 1, scenario: .prewarmedFirst, model: warm, audio: fixture.url,
                 measuresClean: textInstalled))
             for offset in 0..<warmPasses {
                 report.passes.append(await runPass(index: 2 + offset, scenario: .warm, model: warm, audio: fixture.url,
                     measuresClean: textInstalled))
+                // Preserve incomplete evidence if the external test connection is interrupted.
+                // Missing requested passes remain an explicit qualification/comparison failure.
+                if (offset + 1).isMultiple(of: 10) {
+                    var checkpoint = report
+                    checkpoint.hostWorkspaceInitialized = AppLifecycle.bootstrap?.isReady == true
+                    checkpoint.complete()
+                    let data = try FinishLatencyHarness.encode(checkpoint)
+                    try FileManager.default.createDirectory(at: outputURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    try data.write(to: outputURL, options: .atomic)
+                }
             }
             report.runtimeSummaries = warm.performanceSummaries
+            // Diagnostic idle snapshots, outside every latency interval. No inference is requested.
+            for index in 0..<3 {
+                if index > 0 { try await Task.sleep(for: .seconds(2)) }
+                report.resourceSnapshots.append(FinishResourceSnapshot(label: "warm-idle-\(index * 2)s",
+                    measurements: await warm.runtimeResourceSnapshot()))
+            }
         } catch {
             await warm.stopForTermination()
             throw error
         }
         await warm.stopForTermination()
+        report.resourceSnapshots.append(FinishResourceSnapshot(label: "warm-worker-stopped",
+            measurements: await warm.runtimeResourceSnapshot()))
 
+        report.hostWorkspaceInitialized = AppLifecycle.bootstrap?.isReady == true
         report.complete()
         // Persist the complete evidence, failures included, before any assertion.
         let data = try FinishLatencyHarness.encode(report)
@@ -81,6 +114,8 @@ struct FinishLatencyTests {
         Attachment.record(data, named: "finish-latency.json")
         print("FINISH_LATENCY_REPORT " + outputURL.path)
         for line in FinishLatencyHarness.summaryLines(report) { print(line) }
+        try #require(!report.hostWorkspaceInitialized,
+            "The global app workspace initialized during the benchmark; retained evidence is invalid for comparison.")
 
         let failures = report.passes.compactMap { pass in
             pass.failure.map { "pass \(pass.index) (\(pass.scenario.rawValue)): \($0)" }
@@ -89,6 +124,8 @@ struct FinishLatencyTests {
         #expect(report.passes.count == warmPasses + 2)
         let notInsertedExactlyOnce = report.passes.filter { $0.failure == nil && !$0.insertedExactlyOnce }.map(\.index)
         #expect(notInsertedExactlyOnce.isEmpty, "Passes not inserted exactly once: \(notInsertedExactlyOnce)")
+        #expect(!report.qualificationRequested || report.qualified,
+            "Qualification failed: \(report.qualificationFailures.joined(separator: "; "))")
     }
 
     /// One production Finish on a fresh take: raw, then Clean when installed, then delivery.
@@ -147,6 +184,9 @@ struct FinishLatencyTests {
         } catch {
             pass.failure = error.localizedDescription
         }
+        // Keep grammar compilations, matcher counts, model loads and process snapshots beside each pass.
+        // The diagnostic IPC occurs after delivery/receipt timing and never renews the model lease.
+        pass.resourcesAfterPass = await model.runtimeResourceSnapshot()
         return pass
     }
 
@@ -181,7 +221,7 @@ struct FinishLatencyTests {
                     sampleTime: cursor, hostTime: AVAudioTime.hostTime(forSeconds: 100 + Double(cursor) / sampleRate)))
                 cursor += Int64(count)
                 // A short paced feed lets the writer drain without pretending to be the microphone clock.
-                try await Task.sleep(for: .milliseconds(12))
+                try await Task.sleep(for: .milliseconds(2))
             }
             try await writer.finish()
         } catch {
@@ -205,6 +245,7 @@ struct FinishLatencyTests {
 }
 
 /// Fast checks of the harness arithmetic. These never run a model or synthesize audio.
+@Suite(.exclusiveBenchmarkUse)
 struct FinishLatencyHarnessTests {
     @Test("Nearest-rank percentiles match the runtime metrics convention")
     func nearestRankPercentiles() {
@@ -315,6 +356,7 @@ nonisolated struct FinishLatencyPass: Encodable, Sendable {
     var rawText: String?
     var outputText: String?
     var failure: String?
+    var resourcesAfterPass: [String: UInt64] = [:]
 
     init(index: Int, scenario: FinishLatencyScenario) {
         self.index = index
@@ -346,8 +388,20 @@ nonisolated struct FinishLatencyBudget: Encodable, Sendable {
     let met: Bool?
 }
 
+nonisolated struct FinishResourceSnapshot: Encodable, Sendable {
+    let label: String
+    let sampledAt = Date()
+    let measurements: [String: UInt64]
+}
+
 nonisolated struct FinishLatencyReport: Encodable, Sendable {
     let schemaVersion = 1
+    let benchmarkKind = "finish-components-v1"
+    var hostWorkspaceInitialized = false
+    var artifactIdentity: BenchmarkArtifactIdentity?
+    var buildInstrumentation: BenchmarkBuildInstrumentation?
+    var resourceSnapshots: [FinishResourceSnapshot] = []
+    let resourceSamplingScope = "After-pass and short idle diagnostic snapshots, outside latency timing. Includes parent/worker footprint, model load and grammar counters when available. Not continuous sampling, a true combined peak, battery measurement, or sustained-memory qualification."
     let purpose = "Opt-in file-fed timing of the production Finish steps against the engineering budgets. Budgets are targets, not results."
     let generatedAt = Date()
     let operatingSystem = ProcessInfo.processInfo.operatingSystemVersionString
@@ -365,17 +419,23 @@ nonisolated struct FinishLatencyReport: Encodable, Sendable {
     let fixture: FinishLatencyFixture
     let textModelInstalled: Bool
     let requestedWarmPasses: Int
+    let qualificationRequested: Bool
+    private(set) var qualificationFailures: [String] = []
+    private(set) var qualified = false
     var prewarm: TextPrewarmRun?
     var passes: [FinishLatencyPass] = []
     var summaries: [FinishLatencySummary] = []
     var budgets: [FinishLatencyBudget] = []
     var runtimeSummaries: [RuntimeMetricSummary] = []
-    let limitations = "Each pass feeds a locally synthesized English WAV through the production segmented writer at up to about eight times real time (100 ms of audio per 12 ms pause), then times WorkspaceModel.dictationComplete (transcription of the whole saved take, so an upper bound on a live tail whose earlier windows were already transcribed during recording), dictationTransform plus dictationApplyTransform (Clean), and DictationDeliveryService.deliver against an in-memory field. No microphone, capture drain, HUD, coordinator UI, physical shortcut, real Accessibility target, app or clipboard is involved. Cold and prewarmed-first passes use fresh worker processes; OS file and compiled-shader caches may already be warm. Warm passes reuse one worker with both models resident; only they are compared with the budgets. Failed passes are listed and counted; they contribute no timing samples. Synthetic single-speaker English does not establish ASR accuracy, mixed-language behavior, thermal or battery behavior."
+    let fixtureFeedPauseMilliseconds = 2
+    let limitations = "Each pass feeds a locally synthesized English WAV through the production segmented writer at up to about fifty times real time (100 ms of audio per 2 ms pause), then times WorkspaceModel.dictationComplete (transcription of the whole saved take, so an upper bound on a live tail whose earlier windows were already transcribed during recording), dictationTransform plus dictationApplyTransform (Clean), and DictationDeliveryService.deliver against an in-memory field. No microphone, capture drain, HUD, coordinator UI, physical shortcut, real Accessibility target, app or clipboard is involved. Cold and prewarmed-first passes use fresh worker processes; OS file and compiled-shader caches may already be warm. Warm passes reuse one worker with both models resident; only they are compared with the budgets. Failed passes are listed and counted; they contribute no timing samples. Synthetic single-speaker English does not establish ASR accuracy, mixed-language behavior, thermal or battery behavior."
 
-    init(fixture: FinishLatencyFixture, textModelInstalled: Bool, requestedWarmPasses: Int) {
+    init(fixture: FinishLatencyFixture, textModelInstalled: Bool, requestedWarmPasses: Int,
+         qualificationRequested: Bool = ProcessInfo.processInfo.environment["KEYSTORM_PERF_QUALIFY"] == "1") {
         self.fixture = fixture
         self.textModelInstalled = textModelInstalled
         self.requestedWarmPasses = requestedWarmPasses
+        self.qualificationRequested = qualificationRequested
     }
 
     mutating func complete() {
@@ -403,6 +463,41 @@ nonisolated struct FinishLatencyReport: Encodable, Sendable {
                 observedMilliseconds: observed, sampleCount: values.count, failedPasses: failed,
                 met: observed.map { $0 <= budget.milliseconds })
         }
+        qualificationFailures = []
+        qualified = false
+        guard qualificationRequested else { return }
+        if hostWorkspaceInitialized { qualificationFailures.append("The global app workspace contaminated the run.") }
+        if artifactIdentity == nil { qualificationFailures.append("The measured app identity is missing.") }
+        if buildInstrumentation?.llvmProfileInstrumented != false {
+            qualificationFailures.append("Verified absence of LLVM profile/coverage instrumentation is required.")
+        }
+        if buildConfiguration != "Release" { qualificationFailures.append("A true Release build is required.") }
+        if !textModelInstalled { qualificationFailures.append("The local text model was not installed.") }
+        if warm.count < 100 || warm.count != requestedWarmPasses {
+            qualificationFailures.append("At least 100 complete warm passes are required.")
+        }
+        if passes.contains(where: { $0.failure != nil || !$0.insertedExactlyOnce }) {
+            qualificationFailures.append("Every pass must complete and insert exactly once.")
+        }
+        if lowPowerMode || thermalStateAtStart > 1 || (thermalStateAtEnd ?? 3) > 1 {
+            qualificationFailures.append("Low Power Mode must be off and thermal state nominal or fair at both endpoints.")
+        }
+        let workerIDs = Set(warm.compactMap { $0.resourcesAfterPass["workerPID"] })
+        if workerIDs.count != 1 || workerIDs.contains(0) ||
+            warm.contains(where: { $0.resourcesAfterPass["speechModelLoaded"] != 1 ||
+                $0.resourcesAfterPass["textModelLoaded"] != 1 }) {
+            qualificationFailures.append("Warm passes must keep one worker and both models resident.")
+        }
+        for key in ["speechModelLoads", "textModelLoads"] {
+            let values = warm.compactMap { $0.resourcesAfterPass[key] }
+            if values.count != warm.count || Set(values).count != 1 {
+                qualificationFailures.append("Warm passes reloaded a model or lack the counter: " + key)
+            }
+        }
+        for budget in budgets where budget.met != true {
+            qualificationFailures.append("\(budget.metric) \(budget.percentile) did not meet \(budget.budgetMilliseconds) ms.")
+        }
+        qualified = qualificationFailures.isEmpty
     }
 }
 
@@ -568,4 +663,276 @@ private final class FinishLatencyWriterReceipts: Sendable {
     var failures: [String] { state.withLock { $0.failures } }
     func commit(_ segment: AudioSegment) { state.withLock { $0.segments.append(segment) } }
     func fail(_ message: String) { state.withLock { $0.failures.append(message) } }
+}
+
+
+// The same serialized suite owns both model workloads, so they cannot contend for the GPU.
+extension FinishLatencyTests {
+    @Test("Synthetic capture through coordinator Finish records the complete application path",
+          .enabled(if: ProcessInfo.processInfo.environment["KEYSTORM_RUN_COORDINATOR_LATENCY"] == "1"),
+          .timeLimit(.minutes(120)))
+    func syntheticCoordinatorLatency() async throws {
+        try #require(AppLifecycle.bootstrap?.isReady != true,
+            "The global app workspace started inside the benchmark host; this run would be contaminated.")
+        let environment = ProcessInfo.processInfo.environment
+        let warmCount = min(100, max(1, Int(environment["KEYSTORM_COORDINATOR_LATENCY_COUNT"] ?? "") ?? 10))
+        let output = URL(fileURLWithPath: environment["KEYSTORM_COORDINATOR_LATENCY_OUTPUT"] ??
+            "/tmp/Keystorm-ReleaseBenchmarks/coordinator.json")
+        let models = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
+            appropriateFor: nil, create: false).appendingPathComponent("Keystorm/Models", isDirectory: true)
+        let installation = LocalInference(modelDirectory: models)
+        try #require(await installation.isInstalled(ModelCatalog.primarySpeech), "The speech model must be installed.")
+        try #require(await installation.isInstalled(ModelCatalog.primaryText), "The text model must be installed.")
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("Keystorm-CoordinatorLatency-\(UUID())")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fixture = try await FinishLatencyHarness.synthesizeFixture(in: directory)
+        var report = CoordinatorLatencyReport(fixture: fixture.metadata, requestedWarmPassesPerMode: warmCount)
+        let identity = try BenchmarkArtifactIdentity.capture()
+        report.artifactIdentity = identity
+        report.buildInstrumentation = try BenchmarkBuildInstrumentation.capture(identity: identity)
+        for mode in [DictationQuickMode.verbatim, .clean] {
+            let source = try BenchmarkCaptureSource(audio: fixture.url)
+            func workspace(_ label: String) -> WorkspaceModel {
+                WorkspaceModel(root: directory.appendingPathComponent(mode.rawValue + "-" + label),
+                    modelDirectory: models,
+                    capture: AudioCapture(sourceFactory: { source }, allowsDebugFixture: false))
+            }
+            var model = workspace("cold")
+            do {
+                await model.initialize()
+                try #require(model.error == nil, "\(model.error ?? "")")
+                report.passes.append(await coordinatorPass(index: 0, mode: mode, scenario: .cold,
+                    model: model, source: source, expectedFrames: fixture.metadata.frames))
+                if mode == .clean {
+                    report.runtimeSummaries["clean-cold"] = model.performanceSummaries
+                    await model.stopForTermination()
+                    model = workspace("prewarmed")
+                    await model.initialize()
+                    try #require(model.error == nil, "\(model.error ?? "")")
+                    report.textPrewarm = await model.prewarmTextModel()
+                    try #require(report.textPrewarm?.outcome == .loaded || report.textPrewarm?.outcome == .alreadyResident,
+                        "The coordinator first-use prewarm did not complete successfully.")
+                    report.passes.append(await coordinatorPass(index: 1, mode: mode, scenario: .prewarmedFirst,
+                        model: model, source: source, expectedFrames: fixture.metadata.frames))
+                }
+                for index in 0..<warmCount {
+                    report.passes.append(await coordinatorPass(index: index + 2, mode: mode, scenario: .warm,
+                        model: model, source: source, expectedFrames: fixture.metadata.frames))
+                }
+            } catch {
+                await model.stopForTermination()
+                throw error
+            }
+            report.runtimeSummaries[mode.rawValue + "-series"] = model.performanceSummaries
+            await model.stopForTermination()
+        }
+        report.hostWorkspaceInitialized = AppLifecycle.bootstrap?.isReady == true
+        report.complete()
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(report)
+        try FileManager.default.createDirectory(at: output.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try data.write(to: output, options: .atomic)
+        Attachment.record(data, named: "coordinator-latency.json")
+        print("COORDINATOR_LATENCY_REPORT " + output.path)
+        for summary in report.summaries {
+            print("COORDINATOR_LATENCY \(summary.mode) \(summary.scenario) \(summary.metric) n=\(summary.count) p50=\(summary.p50Milliseconds) p95=\(summary.p95Milliseconds)")
+        }
+        try #require(!report.hostWorkspaceInitialized,
+            "The global app workspace initialized during the benchmark; retained evidence is invalid for comparison.")
+        let failures = report.passes.compactMap(\.failure)
+        #expect(failures.isEmpty, "\(failures.joined(separator: "; "))")
+        #expect(report.passes.count == warmCount * 2 + 3)
+    }
+
+    private func coordinatorPass(index: Int, mode: DictationQuickMode, scenario: FinishLatencyScenario,
+                                 model: WorkspaceModel, source: BenchmarkCaptureSource,
+                                 expectedFrames: Int64) async -> CoordinatorLatencyPass {
+        var pass = CoordinatorLatencyPass(index: index, mode: mode.rawValue, scenario: scenario)
+        let adapter = FinishLatencyAdapter()
+        let preferences = DictationPreferences()
+        preferences.mode = mode
+        let coordinator = DictationCoordinator(backend: model,
+            delivery: DictationDeliveryService(adapter: adapter, ownBundleIdentifier: "test.Keystorm.latency",
+                ownProcessIdentifier: 999), preferences: preferences)
+        let pasteboard = NSPasteboard.withUniqueName()
+        coordinator.pasteboard = pasteboard
+        coordinator.announceStatus = { _ in }
+        defer { coordinator.cancelForShutdown(); pasteboard.releaseGlobally() }
+        let previousMetrics = Set(model.performanceMeasurements.map(\.id))
+        do {
+            let start = ContinuousClock.now
+            coordinator.toggle()
+            await coordinator.waitUntilSettled()
+            pass.startToCaptureReadyMilliseconds = FinishLatencyHarness.milliseconds(since: start)
+            guard coordinator.state == .recording, model.isRecording else {
+                throw KeystormError.message("Capture did not start: " + coordinator.message)
+            }
+            let feedStarted = ContinuousClock.now
+            try await source.feed()
+            pass.fixtureFeedMilliseconds = FinishLatencyHarness.milliseconds(since: feedStarted)
+            let finish = ContinuousClock.now
+            coordinator.finish()
+            await coordinator.waitUntilSettled()
+            pass.finishToReadyMilliseconds = FinishLatencyHarness.milliseconds(since: finish)
+            guard coordinator.state == .ready, coordinator.deliveredOnFinish,
+                  adapter.writes == [coordinator.resultText], !coordinator.resultText.isEmpty else {
+                throw KeystormError.message("Finish did not insert exactly once: " + coordinator.message)
+            }
+            guard mode != .clean || coordinator.cleanupFailureReason == nil else {
+                throw KeystormError.message("Clean fell back to raw: " + (coordinator.cleanupFailureReason ?? "unknown"))
+            }
+            guard let handle = coordinator.handle,
+                  let session = model.sessions.first(where: { $0.id == handle.sessionID }),
+                  let take = session.brief?.takes.first(where: { $0.id == handle.takeID }) else {
+                throw KeystormError.message("The completed recording was not retained.")
+            }
+            pass.savedFrames = session.takeSegments(take).reduce(Int64(0)) { $0 + $1.frameCount }
+            guard pass.savedFrames == expectedFrames else {
+                throw KeystormError.message("The complete source audio was not preserved.")
+            }
+            let metrics = model.performanceMeasurements.filter { !previousMetrics.contains($0.id) }
+            pass.captureDrainMilliseconds = metrics.last(where: { $0.kind == "capture.drain" })?.milliseconds
+            guard pass.captureDrainMilliseconds != nil else {
+                throw KeystormError.message("Capture drain was not observed inside Finish.")
+            }
+            pass.insertedExactlyOnce = true
+            pass.outputText = coordinator.resultText
+        } catch {
+            pass.failure = "\(mode.rawValue) \(scenario.rawValue) pass \(index): " + error.localizedDescription
+            coordinator.cancelForShutdown()
+            await coordinator.waitUntilSettled()
+            await model.pauseRecording()
+        }
+        pass.runtimeMeasurements = model.performanceMeasurements.filter { !previousMetrics.contains($0.id) }
+        pass.previewAudioMilliseconds = pass.runtimeMeasurements.filter { $0.kind == "speech.previewAudio" }
+            .reduce(0) { $0 + $1.milliseconds }
+        pass.resourcesAfterPass = await model.runtimeResourceSnapshot()
+        return pass
+    }
+}
+
+/// Preloaded immutable PCM follows the same source seam as AVAudioEngine. It never opens a microphone.
+@MainActor
+private final class BenchmarkCaptureSource: CaptureSource {
+    private struct Chunk {
+        let buffer: AVReadOnlyAudioPCMBuffer
+        let frames: Int64
+    }
+    private let format: AVAudioFormat
+    private let chunks: [Chunk]
+    private var deliver: (@Sendable (AVReadOnlyAudioPCMBuffer, CaptureTimestamp) -> Void)?
+    private var hostOrigin: UInt64 = 0
+
+    init(audio: URL) throws {
+        let file = try AVAudioFile(forReading: audio, commonFormat: .pcmFormatFloat32, interleaved: false)
+        format = file.processingFormat
+        let buffer = try #require(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 1_600))
+        var loaded: [Chunk] = []
+        while file.framePosition < file.length {
+            let count = AVAudioFrameCount(min(1_600, file.length - file.framePosition))
+            try file.read(into: buffer, frameCount: count)
+            guard buffer.frameLength == count else { throw KeystormError.message("The fixture WAV ended early.") }
+            loaded.append(Chunk(buffer: AVReadOnlyAudioPCMBuffer(copying: buffer), frames: Int64(count)))
+        }
+        chunks = loaded
+    }
+
+    func requestAccess() async -> Bool { true }
+    func open() async throws -> AVAudioFormat {
+        guard deliver == nil else { throw KeystormError.message("The fixture source is already delivering.") }
+        return format
+    }
+    func start(deliver: @escaping @Sendable (AVReadOnlyAudioPCMBuffer, CaptureTimestamp) -> Void,
+               onEvent: @escaping @Sendable (CaptureSourceEvent) -> Void) throws {
+        self.deliver = deliver
+        hostOrigin = AVAudioTime.hostTime(forSeconds: ProcessInfo.processInfo.systemUptime)
+    }
+    func stop() { deliver = nil }
+
+    func feed() async throws {
+        let started = ContinuousClock.now
+        var cursor: Int64 = 0
+        for chunk in chunks {
+            let due = started.advanced(by: .seconds(Double(cursor + chunk.frames) / format.sampleRate))
+            try await Task.sleep(for: max(.zero, ContinuousClock.now.duration(to: due)))
+            try Task.checkCancellation()
+            guard let deliver else { throw KeystormError.message("The fixture capture stopped before all frames arrived.") }
+            let offset = AVAudioTime.hostTime(forSeconds: Double(cursor) / format.sampleRate)
+            deliver(chunk.buffer, CaptureTimestamp(sampleTime: cursor, hostTime: hostOrigin + offset))
+            cursor += chunk.frames
+        }
+    }
+}
+
+nonisolated private struct CoordinatorLatencyPass: Encodable {
+    let index: Int
+    let mode: String
+    let scenario: FinishLatencyScenario
+    var startToCaptureReadyMilliseconds: Double?
+    var fixtureFeedMilliseconds: Double?
+    var finishToReadyMilliseconds: Double?
+    var captureDrainMilliseconds: Double?
+    var savedFrames: Int64?
+    var insertedExactlyOnce = false
+    var outputText: String?
+    var failure: String?
+    var resourcesAfterPass: [String: UInt64] = [:]
+    var runtimeMeasurements: [RuntimeMeasurement] = []
+    var previewAudioMilliseconds: Double = 0
+}
+
+nonisolated private struct CoordinatorLatencySummary: Encodable {
+    let mode: String
+    let scenario: String
+    let metric: String
+    let count: Int
+    let p50Milliseconds: Double
+    let p95Milliseconds: Double
+}
+
+nonisolated private struct CoordinatorLatencyReport: Encodable {
+    let schemaVersion = 1
+    let benchmarkKind = "coordinator-synthetic-v1"
+    var hostWorkspaceInitialized = false
+    var artifactIdentity: BenchmarkArtifactIdentity?
+    var buildInstrumentation: BenchmarkBuildInstrumentation?
+    let generatedAt = Date()
+    let buildConfiguration = FinishLatencyHarness.buildConfiguration
+    let hardwareModel = RuntimePerformanceReport.hardwareModel
+    let operatingSystem = ProcessInfo.processInfo.operatingSystemVersionString
+    let thermalStateAtStart = ProcessInfo.processInfo.thermalState.rawValue
+    var thermalStateAtEnd: Int?
+    let lowPowerMode = ProcessInfo.processInfo.isLowPowerModeEnabled
+    let fixture: FinishLatencyFixture
+    let requestedWarmPassesPerMode: Int
+    var textPrewarm: TextPrewarmRun?
+    var passes: [CoordinatorLatencyPass] = []
+    var summaries: [CoordinatorLatencySummary] = []
+    var runtimeSummaries: [String: [RuntimeMetricSummary]] = [:]
+    let qualified = false
+    let scope = "Real-time preloaded synthetic PCM enters the production AudioCapture source seam. Start runs the coordinator and durable capture setup; Finish includes source stop, writer drain, transcription, optional Clean, validation, durable delivery intent, in-memory insertion and receipt persistence. Physical hotkey latency, hardware microphone startup, HUD paint, real Accessibility/app insertion, battery and sustained qualification are excluded. Cold means a fresh worker when the recording begins; normal prewarming during the recording is enabled. The independent text-prewarmed-first case applies only to Clean. Diagnostic distributions, not a physical end-to-end qualification."
+
+    mutating func complete() {
+        thermalStateAtEnd = ProcessInfo.processInfo.thermalState.rawValue
+        let metrics: [(String, KeyPath<CoordinatorLatencyPass, Double?>)] = [
+            ("startToCaptureReady", \.startToCaptureReadyMilliseconds),
+            ("finishToReady", \.finishToReadyMilliseconds),
+            ("captureDrain", \.captureDrainMilliseconds)
+        ]
+        for mode in ["verbatim", "clean"] {
+            for scenario in FinishLatencyScenario.allCases {
+                let selected = passes.filter { $0.mode == mode && $0.scenario == scenario && $0.failure == nil }
+                for (name, key) in metrics {
+                    let values = selected.compactMap { $0[keyPath: key] }.sorted()
+                    guard let median = FinishLatencyHarness.percentile(values, 0.5),
+                          let p95 = FinishLatencyHarness.percentile(values, 0.95) else { continue }
+                    summaries.append(CoordinatorLatencySummary(mode: mode, scenario: scenario.rawValue,
+                        metric: name, count: values.count, p50Milliseconds: median, p95Milliseconds: p95))
+                }
+            }
+        }
+    }
 }

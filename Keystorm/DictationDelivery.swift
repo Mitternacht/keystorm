@@ -234,8 +234,19 @@ struct DictationFieldMetadata {
     /// Secure keyboard entry was on when the metadata was read (`IsSecureEventInputEnabled`). macOS turns it on
     /// while a password field has focus, including browser password inputs, whatever their Accessibility role says.
     var secureEventInput: Bool = false
+    /// Capability query only: AXSelectedTextRange can be set, so a caret can be placed. Read for web and
+    /// rich-text editors that report no text-entry role (Mail's compose body, contenteditable regions).
+    var selectionRangeIsSettable: Bool = false
+    /// The element says it is editable: AXEditable is true, or it reports an editable ancestor. A web page's own
+    /// selection range is settable too, so this (or a settable value) is what separates an editor from a page.
+    var isMarkedEditable: Bool = false
+    /// The element sits inside an AXWebArea (bounded ancestor walk; roles only, never text).
+    var hasWebAreaAncestor: Bool = false
 
     static let pasteFallbackRoles: Set<String> = ["AXTextField", "AXTextArea", "AXComboBox"]
+    /// Roles a web or rich-text editor may report instead of a text-entry role. "AXUnknown" stands for an
+    /// element that reports no role at all.
+    static let webEditorRoles: Set<String> = ["AXWebArea", "AXGroup", "AXScrollArea", "AXStaticText", "AXUnknown"]
     /// Matched case-insensitively inside labels, titles and placeholders (English and German).
     static let secureLabelTerms = ["password", "passwort", "kennwort", "passcode", "passphrase"]
 
@@ -308,14 +319,33 @@ struct DictationFieldMetadata {
             (subrole == nil || subrole == "" || subrole == "AXSearchField")
     }
 
-    /// Paste fallback: an enabled, editable text-entry element. Web and Electron editors qualify only
-    /// when they report one of these roles; groups, web areas, unknown subroles and terminal inputs
-    /// stay Copy-only.
+    /// Paste fallback: an enabled, editable element. Text-entry roles qualify with a settable selection or value.
+    /// Web and rich-text editors that report another role (a web area, group or role-less element) qualify only
+    /// with explicit editable evidence (see `isWebEditorCandidate`). Secure fields, terminal inputs, buttons,
+    /// unknown subroles and plain pages stay Copy-only.
     var acceptsPasteFallback: Bool {
-        !isSecure && !isTerminalInput && isEnabled && (selectedTextIsSettable || valueIsSettable) &&
-            Self.pasteFallbackRoles.contains(role) &&
-            (subrole == nil || subrole == "" || subrole == "AXSearchField")
+        guard !isSecure, !isTerminalInput, isEnabled,
+              subrole == nil || subrole == "" || subrole == "AXSearchField" else { return false }
+        if Self.pasteFallbackRoles.contains(role) { return selectedTextIsSettable || valueIsSettable }
+        return isWebEditorCandidate
     }
+
+    /// A web or rich-text editor without a text-entry role: a caret can be placed in it, and it is editable by an
+    /// explicit marker or capability rather than by guesswork. A web area qualifies on its own; a group, scroll
+    /// area or role-less element must also sit in a web area (or be marked editable); static text must be marked.
+    var isWebEditorCandidate: Bool {
+        guard Self.webEditorRoles.contains(role), selectionRangeIsSettable,
+              isMarkedEditable || selectedTextIsSettable || valueIsSettable else { return false }
+        switch role {
+        case "AXWebArea": return true
+        case "AXStaticText": return isMarkedEditable
+        default: return hasWebAreaAncestor || isMarkedEditable
+        }
+    }
+
+    /// True for the paste fallback's web-editor path: no text-entry role. Its selection must be readable, since
+    /// the caret is then the only identity check the paste has.
+    var usesWebEditorPath: Bool { !Self.pasteFallbackRoles.contains(role) }
 }
 
 struct DictationFieldSnapshot {
@@ -369,6 +399,12 @@ protocol DictationDeliveryAdapter {
     /// Website exclusions only, and only while a website is blocked: the addresses of the web documents that
     /// contain the field. Ancestor roles and a web area's AXURL only; never any field's value.
     func webDocumentURLs(containing field: any DictationDeliveryField) -> DictationWebDocumentLookup
+    /// Undo, qualified fields only (their text was read at delivery): selects `range`, replaces it with `text`,
+    /// then selects `finalSelection`. The only operation that moves the selection.
+    func replaceRange(_ range: NSRange, with text: String, finalSelection: NSRange,
+                      in field: any DictationDeliveryField) -> DictationReplacementAcknowledgment
+    /// Undo, paste fallback: one directed Command-Z to the process. False when it cannot be posted.
+    func postUndoShortcut(processIdentifier: Int32) -> Bool
 }
 
 @MainActor
@@ -408,6 +444,10 @@ extension DictationDeliveryAdapter {
     }
     /// An adapter that cannot tell where a field is fails safe: with any website blocked, it is unverified.
     func webDocumentURLs(containing field: any DictationDeliveryField) -> DictationWebDocumentLookup { .unavailable }
+    /// Adapters without these never undo; the service then refuses and says so.
+    func replaceRange(_ range: NSRange, with text: String, finalSelection: NSRange,
+                      in field: any DictationDeliveryField) -> DictationReplacementAcknowledgment { .rejected }
+    func postUndoShortcut(processIdentifier: Int32) -> Bool { false }
 }
 
 /// Paste fallback timing. Injectable so tests need not wait for real clipboard readers.
@@ -500,6 +540,31 @@ final class DictationDeliveryService {
     private let accessibilityWarmUp: DictationAccessibilityWarmUp
     /// Live AXManualAccessibility grants by process; weak, so only captures keep them alive.
     private var manualAccessibilityGrants: [Int32: WeakManualAccessibilityGrant] = [:]
+    /// Memory-only record of the last confirmed insertion, for `undoLastInsertion`. Replaced by every new
+    /// delivery attempt, cleared by an undo and after `undoMaximumAge`. Never persisted or logged.
+    private var lastInsertion: LastInsertion?
+    private var undoInFlight = false
+    /// Observable availability of the undo, for the menu, shortcut and HUD.
+    let undoState = DictationUndoState()
+    /// An undo is offered for this long after the insertion; replaceable so tests need not wait.
+    static let undoMaximumAge: TimeInterval = 15 * 60
+    /// The clock for that age; replaceable in tests.
+    var undoClock: @MainActor @Sendable () -> Date = { Date() }
+
+    private struct LastInsertion {
+        enum Method {
+            /// A qualified field: the exact range written, the text it replaced, and the whole field's text after.
+            case range(inserted: NSRange, replaced: String, afterDigest: SHA256.Digest, afterUTF16: Int)
+            /// The paste fallback: the app's own Command-Z, while the caret still sits where the paste left it.
+            case shortcut(before: NSRange?, after: NSRange?)
+        }
+        let deliveryID: UUID
+        let descriptor: DictationDestinationDescriptor
+        let field: any DictationDeliveryField
+        let text: String
+        let recordedAt: Date
+        let method: Method
+    }
 
     init(adapter: (any DictationDeliveryAdapter)? = nil,
          ownBundleIdentifier: String = Bundle.main.bundleIdentifier ?? "Keystorm",
@@ -544,6 +609,14 @@ final class DictationDeliveryService {
                          pasteIntoOtherApps: Bool = false,
                          exclusions: DictationUserExclusions = .empty) -> DictationStartCapture {
         stopCorrectionObservation()
+        #if DEBUG
+        // Isolated file-audio accuracy runs measure the text, not the destination: with this set, the app in front
+        // of the run (and whatever field it has focused) neither blocks Start nor receives the result.
+        if ProcessInfo.processInfo.environment["KEYSTORM_DEBUG_NO_DESTINATION"] == "1",
+           (try? DebugAudioValidationConfiguration.configuration()) != nil {
+            return DictationStartCapture(target: .unavailable(.noExternalApplication), context: nil)
+        }
+        #endif
         guard let app = adapter.frontmostApplication(),
               app.processIdentifier != ownProcessIdentifier,
               app.bundleIdentifier != ownBundleIdentifier else {
@@ -729,6 +802,9 @@ final class DictationDeliveryService {
         let selection = adapter.selectedTextRange(of: field).flatMap { range in
             range.location >= 0 && range.length >= 0 && range.location != NSNotFound ? range : nil
         }
+        // A web or rich-text editor without a text-entry role needs a readable caret: it is the only check
+        // that the paste lands where it was captured.
+        if metadata.usesWebEditorPath, selection == nil { return .notFound(.unsupportedField) }
         guard isStillFocused(field, application: app) else { return .final(.unavailable(.targetChanged)) }
         return .final(.ready(DictationCapturedTarget(pasteFallback: DictationDestinationDescriptor(
                 appName: app.name, bundleIdentifier: app.bundleIdentifier,
@@ -770,6 +846,8 @@ final class DictationDeliveryService {
         }
         inFlightDeliveryID = deliveryID
         defer { inFlightDeliveryID = nil }
+        // A new attempt supersedes the previous insertion: only the newest one can be undone.
+        forgetLastInsertion()
         guard target.ownerID == ownerID else {
             return record(.failed, "This destination belongs to another dictation session.", target: target, deliveryID: deliveryID)
         }
@@ -871,6 +949,11 @@ final class DictationDeliveryService {
                     target.confirmedCorrectionAnchor = ExternalCorrectionAnchor(fieldText: expected,
                         insertedRange: NSRange(location: current.selection.location, length: text.utf16.count), originalText: text)
                     target.confirmedCorrectionDeliveryID = deliveryID
+                    // Exact range, replaced text and the field's resulting text: enough to undo without guessing.
+                    recordInsertion(deliveryID: deliveryID, target: target, text: text, method: .range(
+                        inserted: NSRange(location: current.selection.location, length: text.utf16.count),
+                        replaced: (current.text as NSString).substring(with: current.selection),
+                        afterDigest: SHA256.hash(data: Data(expected.utf8)), afterUTF16: expected.utf16.count))
                     return record(.confirmed, "Inserted into \(target.descriptor.appName).", target: target, deliveryID: deliveryID)
                 }
                 guard check < 19, !Task.isCancelled else { break }
@@ -944,6 +1027,9 @@ final class DictationDeliveryService {
         if paste.stagedTextWasRead {
             // Let the destination finish reading before the original clipboard returns.
             try? await Task.sleep(for: pasteTiming.settleDelay)
+            // Where the caret ended up, as a number only: Undo later requires it to still be exactly there.
+            recordInsertion(deliveryID: deliveryID, target: target, text: text, method: .shortcut(
+                before: target.pasteSelection, after: Self.validSelection(adapter.selectedTextRange(of: target.field))))
             return record(.pasted, "Pasted into \(target.descriptor.appName).", target: target, deliveryID: deliveryID)
         }
         // Sent, but no read evidence by the deadline (or cancelled after posting). The destination may still
@@ -1068,6 +1154,174 @@ final class DictationDeliveryService {
         correctionLease = nil
     }
 
+    // MARK: Undo
+
+    /// True while a confirmed insertion can still be offered for undo. Whether it succeeds is decided at undo time.
+    var canUndoLastInsertion: Bool { currentLastInsertion() != nil }
+
+    /// Drops the undo record, for example when the app shuts down.
+    func forgetLastInsertion() {
+        lastInsertion = nil
+        undoState.publish(destinationName: nil)
+    }
+
+    private func recordInsertion(deliveryID: UUID, target: DictationCapturedTarget, text: String,
+                                 method: LastInsertion.Method) {
+        lastInsertion = LastInsertion(deliveryID: deliveryID, descriptor: target.descriptor, field: target.field,
+                                      text: text, recordedAt: undoClock(), method: method)
+        undoState.publish(destinationName: target.descriptor.appName)
+    }
+
+    private func currentLastInsertion() -> LastInsertion? {
+        guard let record = lastInsertion else { return nil }
+        guard undoClock().timeIntervalSince(record.recordedAt) <= Self.undoMaximumAge else {
+            forgetLastInsertion()
+            return nil
+        }
+        return record
+    }
+
+    private static func validSelection(_ range: NSRange?) -> NSRange? {
+        guard let range, range.location >= 0, range.length >= 0, range.location != NSNotFound else { return nil }
+        return range
+    }
+
+    /// Undoes the last confirmed insertion, only while it can be proven safe, and otherwise changes nothing and
+    /// says why. Text the user typed afterwards is never touched.
+    ///
+    /// - A qualified field (TextEdit) replaces the exact inserted range with the text it replaced, after checking
+    ///   that the field is unchanged since the insertion, or that the range still holds exactly the inserted text.
+    ///   It is the one operation that moves the selection, which ends on the restored text.
+    /// - The paste fallback sends the app's own Command-Z, and only while the caret still sits exactly where the
+    ///   paste left it. Nothing is read from the field.
+    /// Both need the destination's field to be the one focused now, Accessibility access, and no exclusion of the
+    /// app or website since. A record is used once: an undo that was attempted, confirmed or not, ends it.
+    func undoLastInsertion(exclusions: DictationUserExclusions = .empty) async -> DictationUndoReceipt {
+        guard let record = currentLastInsertion() else {
+            return DictationUndoReceipt(outcome: .nothingToUndo, message: "There is no recent dictation to undo.", destination: nil)
+        }
+        let name = record.descriptor.appName
+        func refuse(_ reason: String) -> DictationUndoReceipt {
+            DictationUndoReceipt(outcome: .refused, message: reason + " Nothing was changed.", destination: record.descriptor)
+        }
+        guard !undoInFlight, inFlightDeliveryID == nil else { return refuse("Another insertion or undo is still in progress.") }
+        undoInFlight = true
+        defer { undoInFlight = false }
+        // The undo is a change the user asked for, not a correction to learn from.
+        stopCorrectionObservation()
+        guard adapter.isTrusted else { return refuse("Accessibility access is unavailable. Press Command-Z in \(name) instead.") }
+        if isExcluded(record.descriptor.bundleIdentifier, exclusions: exclusions) {
+            return refuse("Dictation is excluded in \(name).")
+        }
+        let app = DictationDeliveryApplication(processIdentifier: record.descriptor.processIdentifier,
+            bundleIdentifier: record.descriptor.bundleIdentifier, name: name)
+        guard isStillFocused(record.field, application: app) else {
+            return refuse("The app or text field changed since the dictation. Return to it, or press Command-Z there.")
+        }
+        switch websiteVerdict(for: record.field, websites: exclusions.websites) {
+        case .blocked, .unverified:
+            return refuse("Dictation is excluded on this website, or its address can't be checked.")
+        case .notChecked, .notWebContent, .allowed:
+            break
+        }
+        guard !Task.isCancelled else { return refuse("The undo was cancelled.") }
+        switch record.method {
+        case .range(let inserted, let replaced, let afterDigest, let afterUTF16):
+            return await undoRange(record, inserted: inserted, replaced: replaced, afterDigest: afterDigest,
+                                   afterUTF16: afterUTF16, application: app, refuse: refuse)
+        case .shortcut(let before, let after):
+            return await undoWithShortcut(record, before: before, after: after, application: app, refuse: refuse)
+        }
+    }
+
+    private func undoRange(_ record: LastInsertion, inserted: NSRange, replaced: String, afterDigest: SHA256.Digest,
+                           afterUTF16: Int, application app: DictationDeliveryApplication,
+                           refuse: (String) -> DictationUndoReceipt) async -> DictationUndoReceipt {
+        let name = record.descriptor.appName
+        do {
+            let metadata = try adapter.metadata(for: record.field)
+            guard metadata.processIdentifier == app.processIdentifier, metadata.supportsInsertion else {
+                return refuse("The field no longer supports safe editing.")
+            }
+            let current = try adapter.snapshot(of: record.field, maximumUTF16: Self.maximumFieldUTF16)
+            guard current.isValid(maximumUTF16: Self.maximumFieldUTF16) else { return refuse("The field could not be read safely.") }
+            let value = current.text as NSString
+            // Unchanged since the insertion, or the inserted range still holds exactly the inserted text. Typing
+            // before it shifts the range, which fails the second test; typing after it passes and is left alone.
+            let unchanged = value.length == afterUTF16 && SHA256.hash(data: Data(current.text.utf8)) == afterDigest
+            guard inserted.location >= 0, inserted.length >= 0, inserted.location <= value.length,
+                  inserted.length <= value.length - inserted.location,
+                  unchanged || value.substring(with: inserted).utf8.elementsEqual(record.text.utf8) else {
+                return refuse("The text around the dictation changed, so it can't be removed safely.")
+            }
+            let expected = value.replacingCharacters(in: inserted, with: replaced)
+            guard expected.utf16.count <= Self.maximumFieldUTF16 else { return refuse("The result would be too large.") }
+            guard isStillFocused(record.field, application: app) else { return refuse("Focus changed before the undo.") }
+            guard !Task.isCancelled else { return refuse("The undo was cancelled.") }
+            let restored = NSRange(location: inserted.location, length: replaced.utf16.count)
+            guard adapter.replaceRange(inserted, with: replaced, finalSelection: restored, in: record.field) != .rejected else {
+                return refuse("\(name) refused the change. Press Command-Z there instead.")
+            }
+            // Written once: whatever happens next, this record is spent.
+            forgetLastInsertion()
+            for check in 0..<20 {
+                guard isStillFocused(record.field, application: app) else { break }
+                if let after = try? adapter.snapshot(of: record.field, maximumUTF16: Self.maximumFieldUTF16),
+                   after.isValid(maximumUTF16: Self.maximumFieldUTF16), after.text.utf8.elementsEqual(expected.utf8) {
+                    return DictationUndoReceipt(outcome: .undone, message: "Undid the last dictation in \(name).",
+                                                destination: record.descriptor)
+                }
+                guard check < 19, !Task.isCancelled else { break }
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            return DictationUndoReceipt(outcome: .uncertain,
+                message: "The undo was sent to \(name) but could not be confirmed. Check the text there.",
+                destination: record.descriptor)
+        } catch {
+            return refuse("The field could not be read safely.")
+        }
+    }
+
+    private func undoWithShortcut(_ record: LastInsertion, before: NSRange?, after: NSRange?,
+                                  application app: DictationDeliveryApplication,
+                                  refuse: (String) -> DictationUndoReceipt) async -> DictationUndoReceipt {
+        let name = record.descriptor.appName
+        // Without the caret the paste left, there is no way to tell whether the user typed since.
+        guard let after else {
+            return refuse("Keystorm could not confirm where the dictation ended. Press Command-Z in \(name) if you want it removed.")
+        }
+        guard adapter.canPostPasteEvents else { return refuse("Keyboard events are unavailable.") }
+        guard let metadata = try? adapter.metadata(for: record.field), metadata.processIdentifier == app.processIdentifier,
+              !metadata.isSecure, metadata.acceptsPasteFallback else {
+            return refuse("The field no longer accepts safe editing.")
+        }
+        guard adapter.selectedTextRange(of: record.field) == after else {
+            return refuse("The cursor moved after the dictation, so it may have been edited.")
+        }
+        guard isStillFocused(record.field, application: app), !Task.isCancelled else {
+            return refuse("Focus changed before the undo.")
+        }
+        guard adapter.postUndoShortcut(processIdentifier: app.processIdentifier) else {
+            return refuse("The undo shortcut could not be sent.")
+        }
+        // Sent once: a second Command-Z would undo something else, so this record is spent.
+        forgetLastInsertion()
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: pasteTiming.evidenceTimeout)
+        var current = adapter.selectedTextRange(of: record.field)
+        while current == after, clock.now < deadline, !Task.isCancelled {
+            try? await Task.sleep(for: pasteTiming.pollInterval)
+            current = adapter.selectedTextRange(of: record.field)
+        }
+        if let current, current != after, before == nil || current == before {
+            return DictationUndoReceipt(outcome: .undone, message: "Undid the last dictation in \(name).",
+                                        destination: record.descriptor)
+        }
+        return DictationUndoReceipt(outcome: .uncertain,
+            message: "Command-Z was sent to \(name) but its effect could not be confirmed. Check the text there.",
+            destination: record.descriptor)
+    }
+
     private func isStillFocused(_ field: any DictationDeliveryField, application: DictationDeliveryApplication) -> Bool {
         guard let front = adapter.frontmostApplication(),
               front.processIdentifier == application.processIdentifier,
@@ -1133,8 +1387,11 @@ private final class NativeDictationDeliveryAdapter: DictationDeliveryAdapter {
     func metadata(for field: any DictationDeliveryField) throws -> DictationFieldMetadata {
         let element = try native(field)
         var pid: pid_t = 0
-        guard AXUIElementGetPid(element, &pid) == .success,
-              let role = try attribute(kAXRoleAttribute, of: element) as? String else { throw DictationAXError.unavailable }
+        guard AXUIElementGetPid(element, &pid) == .success else { throw DictationAXError.unavailable }
+        // An element with no role at all (some web editors) is "AXUnknown"; an unreadable or non-string role fails closed.
+        let roleValue = try optionalAttribute(kAXRoleAttribute, of: element)
+        guard roleValue == nil || roleValue is String else { throw DictationAXError.unavailable }
+        let role = (roleValue as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "AXUnknown"
         // Security markers: absent means not set, but an unreadable marker is unknown and fails closed. A subrole
         // lost to a timeout must never let a secure text field pass as a plain one.
         let subroleValue = try optionalAttribute(kAXSubroleAttribute, of: element)
@@ -1161,10 +1418,53 @@ private final class NativeDictationDeliveryAdapter: DictationDeliveryAdapter {
         let editable = AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &valueSettable) == .success && valueSettable.boolValue
         let qualifiedPaste = role == "AXTextArea" && editable && CGPreflightPostEventAccess() &&
             NSRunningApplication(processIdentifier: pid)?.bundleIdentifier == "com.apple.TextEdit"
-        return DictationFieldMetadata(processIdentifier: pid, role: role, subrole: subrole,
+        var metadata = DictationFieldMetadata(processIdentifier: pid, role: role, subrole: subrole,
             isEnabled: enabled, isProtected: false, selectedTextIsSettable: status == .success && settable.boolValue,
             supportsPaste: qualifiedPaste, valueIsSettable: editable,
             isTerminalInput: isTerminalInput(element, labels: labels))
+        // Web and rich-text editors without a text-entry role: capability and marker queries only, and only
+        // for such roles, so ordinary text fields cost no extra Accessibility calls.
+        if !DictationFieldMetadata.pasteFallbackRoles.contains(role), DictationFieldMetadata.webEditorRoles.contains(role) {
+            var rangeSettable = DarwinBoolean(false)
+            metadata.selectionRangeIsSettable = AXUIElementIsAttributeSettable(
+                element, kAXSelectedTextRangeAttribute as CFString, &rangeSettable) == .success && rangeSettable.boolValue
+            if metadata.selectionRangeIsSettable {
+                metadata.isMarkedEditable = isMarkedEditable(element)
+                metadata.hasWebAreaAncestor = role == "AXWebArea" || isInsideWebArea(element)
+            }
+        }
+        return metadata
+    }
+
+    /// The deepest ancestor chain the editor heuristic walks. Shorter than the website-exclusion walk: it is a
+    /// hint, and an editor deeper than this simply stays Copy-only.
+    private static let maximumEditorAncestry = 48
+
+    /// AXEditable is true, or the element reports an editable ancestor (Chromium and WebKit expose
+    /// AXEditableAncestor and AXHighestEditableAncestor for contenteditable regions). Markers only, never text.
+    private func isMarkedEditable(_ element: AXUIElement) -> Bool {
+        if let editable = (try? optionalAttribute("AXEditable", of: element)) as? NSNumber, editable.boolValue { return true }
+        for name in ["AXEditableAncestor", "AXHighestEditableAncestor"] {
+            if let value = try? optionalAttribute(name, of: element), CFGetTypeID(value) == AXUIElementGetTypeID() { return true }
+        }
+        return false
+    }
+
+    /// Walks AXParent looking for an AXWebArea. Roles only; the first error ends the walk as "not inside".
+    private func isInsideWebArea(_ field: AXUIElement) -> Bool {
+        var element = field
+        for _ in 0..<Self.maximumEditorAncestry {
+            var parentValue: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(element, kAXParentAttribute as CFString, &parentValue) == .success,
+                  let parentValue, CFGetTypeID(parentValue) == AXUIElementGetTypeID() else { return false }
+            element = unsafeBitCast(parentValue, to: AXUIElement.self)
+            AXUIElementSetMessagingTimeout(element, 0.25)
+            var roleValue: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleValue) == .success,
+                  let role = roleValue as? String else { return false }
+            if role == "AXWebArea" { return true }
+        }
+        return false
     }
 
     /// xterm.js marks its hidden input with a DOM class (Chromium and Electron expose `AXDOMClassList`) and
@@ -1283,6 +1583,39 @@ private final class NativeDictationDeliveryAdapter: DictationDeliveryAdapter {
         case .cannotComplete, .failure: return .unknown
         default: return .rejected
         }
+    }
+
+    func replaceRange(_ range: NSRange, with text: String, finalSelection: NSRange,
+                      in field: any DictationDeliveryField) -> DictationReplacementAcknowledgment {
+        guard let element = try? native(field), setSelection(range, of: element) else { return .rejected }
+        let acknowledgment: DictationReplacementAcknowledgment
+        switch AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, text as CFString) {
+        case .success: acknowledgment = .accepted
+        case .cannotComplete, .failure: acknowledgment = .unknown
+        default: acknowledgment = .rejected
+        }
+        // Best effort: leave the restored text selected, as it was before the dictation replaced it.
+        if acknowledgment != .rejected { _ = setSelection(finalSelection, of: element) }
+        return acknowledgment
+    }
+
+    private func setSelection(_ range: NSRange, of element: AXUIElement) -> Bool {
+        var cfRange = CFRange(location: range.location, length: range.length)
+        guard let value = AXValueCreate(.cfRange, &cfRange) else { return false }
+        return AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, value) == .success
+    }
+
+    func postUndoShortcut(processIdentifier: Int32) -> Bool {
+        let key = DictationPasteKeyCode.currentUndo()
+        guard CGPreflightPostEventAccess(), let source = CGEventSource(stateID: .privateState),
+              let down = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: true),
+              let up = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: false) else { return false }
+        source.localEventsSuppressionInterval = 0
+        down.flags = .maskCommand
+        up.flags = .maskCommand
+        down.postToPid(processIdentifier)
+        up.postToPid(processIdentifier)
+        return true
     }
 
     func observeChanges(of field: any DictationDeliveryField, processIdentifier: Int32,
@@ -1658,21 +1991,46 @@ enum DictationPasteKeyCode {
         return virtualKey(in: source)
     }
 
+    static let undoFallback = CGKeyCode(kVK_ANSI_Z)
+
+    /// The same resolution for Command-Z (undo): kVK_ANSI_Z when it types "z" with Command held, otherwise the
+    /// lowest key code that does, otherwise kVK_ANSI_Z.
+    static func resolveUndo(translate: ((UInt16) -> String?)?) -> CGKeyCode {
+        guard let translate else { return undoFallback }
+        if translate(UInt16(undoFallback)) == "z" { return undoFallback }
+        return candidates.first { translate($0) == "z" } ?? undoFallback
+    }
+
+    /// The virtual key for Command-Z in the current keyboard layout.
+    @MainActor
+    static func currentUndo() -> CGKeyCode {
+        guard let source = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue() else {
+            return resolveUndo(translate: nil)
+        }
+        return virtualKey(in: source, resolver: { resolveUndo(translate: $0) })
+    }
+
     /// Resolves against one keyboard layout input source without selecting it.
     @MainActor
     static func virtualKey(in source: TISInputSource) -> CGKeyCode {
+        virtualKey(in: source, resolver: { resolve(translate: $0) })
+    }
+
+    @MainActor
+    private static func virtualKey(in source: TISInputSource,
+                                   resolver: (((UInt16) -> String?)?) -> CGKeyCode) -> CGKeyCode {
         guard let property = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData) else {
-            return resolve(translate: nil)
+            return resolver(nil)
         }
         // The layout data follows the Get rule: it lives as long as `source`.
         return withExtendedLifetime(source) {
             let data = Unmanaged<CFData>.fromOpaque(property).takeUnretainedValue()
             guard CFDataGetLength(data) >= MemoryLayout<UCKeyboardLayout>.size,
-                  let bytes = CFDataGetBytePtr(data) else { return resolve(translate: nil) }
+                  let bytes = CFDataGetBytePtr(data) else { return resolver(nil) }
             let layout = UnsafeRawPointer(bytes).assumingMemoryBound(to: UCKeyboardLayout.self)
             let keyboardType = UInt32(LMGetKbdType())
             let commandState = UInt32((cmdKey >> 8) & 0xFF)
-            return resolve { keyCode in
+            return resolver { keyCode in
                 var deadKeyState: UInt32 = 0
                 var length = 0
                 var characters = [UniChar](repeating: 0, count: 4)

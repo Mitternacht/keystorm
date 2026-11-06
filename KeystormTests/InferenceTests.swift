@@ -140,7 +140,7 @@ struct InferenceTests {
         let installedBytes = try Data(contentsOf: artifactURL)
         #expect(installedBytes == bytes)
         let children = try FileManager.default.contentsOfDirectory(atPath: root.path)
-        #expect(children == [model.id])
+        #expect(children.filter { !$0.hasPrefix(".") } == [model.id])
     }
 
     @Test func packedEightBitTensorFailsFourBitAudit() throws {

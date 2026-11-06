@@ -17,9 +17,17 @@ final class AudioCapture {
     /// Synchronous engine/tap teardown only; excludes event dispatch and durable writer drain.
     private(set) var lastMicrophoneStopMilliseconds: Double = 0
 
-    @ObservationIgnored private var engine: AVAudioEngine?
-    @ObservationIgnored private var inputTapNode: AVAudioInputNode?
+    /// Audio sample gaps and clock jumps absorbed in the current interval without ending the take.
+    private(set) var discontinuityCount = 0
+
+    @ObservationIgnored private let sourceFactory: @MainActor () -> any CaptureSource
+    @ObservationIgnored private let clock: CaptureClock
+    @ObservationIgnored private let stallTimeout: Double
+    @ObservationIgnored private let firstBufferTimeout: Double
+    @ObservationIgnored private let allowsDebugFixture: Bool
+    @ObservationIgnored private var source: (any CaptureSource)?
     #if DEBUG
+    @ObservationIgnored private var debugEngine: AVAudioEngine?
     private(set) var debugAudioSourceStatus: String?
     @ObservationIgnored private var debugFixtureTask: Task<Void, Never>?
     @ObservationIgnored private var debugFixtureDirectory: URL?
@@ -32,7 +40,6 @@ final class AudioCapture {
     @ObservationIgnored private var writer: SegmentedAudioWriter?
     @ObservationIgnored private var liveBuffer: LiveAudioBuffer?
     @ObservationIgnored private var activity: (any NSObjectProtocol)?
-    @ObservationIgnored private var observers: [(NotificationCenter, any NSObjectProtocol)] = []
     @ObservationIgnored private var progressTask: Task<Void, Never>?
     @ObservationIgnored private var generation = UUID()
     private var isStarting = false
@@ -40,14 +47,30 @@ final class AudioCapture {
     var isTransitioning: Bool { isStarting || isStopping }
     @ObservationIgnored private var stopWaiters: [CheckedContinuation<Void, any Error>] = []
     @ObservationIgnored private var failureHandler: (@Sendable (String) -> Void)?
+    @ObservationIgnored private var interruptionHandler: (@Sendable (CaptureInterruption) -> Void)?
 
+    /// `sourceFactory` is called once per interval, so a resume after a route change opens the input that is the
+    /// default then. Tests inject a fake source and clock; the app uses the AVAudioEngine microphone.
+    init(sourceFactory: @escaping @MainActor () -> any CaptureSource = { EngineCaptureSource() },
+         clock: CaptureClock = .system, stallTimeout: Double = 2, firstBufferTimeout: Double = 5,
+         allowsDebugFixture: Bool = true) {
+        self.sourceFactory = sourceFactory
+        self.clock = clock
+        self.stallTimeout = stallTimeout
+        self.firstBufferTimeout = firstBufferTimeout
+        self.allowsDebugFixture = allowsDebugFixture
+    }
+
+    /// `onFailure` reports a stop that may have lost audio. `onInterruption`, when given, receives the stops that
+    /// lose none (route change, sleep, stall); without it those arrive through `onFailure` as before.
     func start(
         directory: URL,
         startTime: Double,
         intervalID: UUID,
         enableLivePreview: Bool = false,
         onCommit: @escaping @Sendable (AudioSegment) -> Void,
-        onFailure: @escaping @Sendable (String) -> Void
+        onFailure: @escaping @Sendable (String) -> Void,
+        onInterruption: (@Sendable (CaptureInterruption) -> Void)? = nil
     ) async throws -> CaptureInterval {
         guard !isRecording, writer == nil, !isStarting, !isStopping else {
             throw KeystormError.message("A recording is already starting or running.")
@@ -55,76 +78,93 @@ final class AudioCapture {
         isStarting = true
         defer { isStarting = false }
         #if DEBUG
-        if let configuration = try DebugAudioValidationConfiguration.configuration() {
+        if allowsDebugFixture, let configuration = try DebugAudioValidationConfiguration.configuration() {
             return try await startDebugFixture(configuration: configuration, directory: directory,
                 startTime: startTime, intervalID: intervalID, enableLivePreview: enableLivePreview,
                 onCommit: onCommit, onFailure: onFailure)
         }
         #endif
-        guard await AVCaptureDevice.requestAccess(for: .audio) else {
+        let source = sourceFactory()
+        guard await source.requestAccess() else {
             throw KeystormError.message("Microphone access is required. Enable it in System Settings → Privacy & Security → Microphone.")
         }
-        let engine = AVAudioEngine()
-        let input = engine.inputNode
-        let format = input.outputFormat(forBus: 0)
-        guard format.sampleRate > 0, format.channelCount > 0 else {
-            throw KeystormError.message("The microphone has no usable audio format. Reconnect it and resume explicitly.")
-        }
+        let format: AVAudioFormat
+        do { format = try await source.open() }
+        catch { source.stop(); throw error }
         let token = UUID()
         generation = token
         failureHandler = onFailure
-        let writer = try SegmentedAudioWriter(
-            directory: directory, format: format, intervalID: intervalID, startTime: startTime,
-            onCommit: onCommit,
-            onFailure: { [weak self] message in
-                Task { @MainActor in
-                    guard let self, self.generation == token else { return }
-                    await self.interrupt(message)
+        interruptionHandler = onInterruption
+        let writer: SegmentedAudioWriter
+        do {
+            writer = try SegmentedAudioWriter(
+                directory: directory, format: format, intervalID: intervalID, startTime: startTime,
+                uptime: clock.uptime,
+                onCommit: onCommit,
+                onFailure: { [weak self] message in
+                    Task { @MainActor in
+                        guard let self, self.generation == token else { return }
+                        await self.interrupt(message)
+                    }
+                },
+                onFormatChange: { [weak self] in
+                    Task { @MainActor in
+                        guard let self, self.generation == token else { return }
+                        await self.interrupt(.routeChanged)
+                    }
                 }
-            }
-        )
+            )
+        } catch {
+            source.stop()
+            failureHandler = nil
+            interruptionHandler = nil
+            throw error
+        }
         let liveBuffer = enableLivePreview ? LiveAudioBuffer(format: format, intervalID: intervalID) : nil
         self.liveBuffer = liveBuffer
         self.writer = writer
-        self.engine = engine
+        self.source = source
         sampleRate = format.sampleRate
         channelCount = Int(format.channelCount)
         elapsed = 0
+        discontinuityCount = 0
         hostTime = mach_absolute_time()
         do {
-            // The new tap owns immutable Sendable samples; retaining a buffer does not
-            // retain a mutable engine scratch buffer. Admission is bounded before enqueue.
-            try input.installAudioTap(
-                onBus: 0, bufferSize: AVAudioFrameCount(format.sampleRate * 0.1), format: format
-            ) { buffer, time in
-                let timestamp = CaptureTimestamp(time)
-                writer.enqueue(buffer, timestamp: timestamp)
-                liveBuffer?.enqueue(buffer, timestamp: timestamp)
-            }
-            inputTapNode = input
-            engine.prepare()
-            try engine.start()
+            try source.start(
+                deliver: { buffer, timestamp in
+                    writer.enqueue(buffer, timestamp: timestamp)
+                    liveBuffer?.enqueue(buffer, timestamp: timestamp)
+                },
+                onEvent: { [weak self] event in
+                    // Engine teardown is asynchronous, outside AVAudioEngine's internal callback.
+                    Task { @MainActor in
+                        guard let self, self.generation == token else { return }
+                        await self.handle(event)
+                    }
+                })
             isRecording = true
             activity = ProcessInfo.processInfo.beginActivity(
                 options: [.idleSystemSleepDisabled, .userInitiated],
                 reason: "Preserving an active voice recording"
             )
-            observeInterruptions(engine: engine, token: token)
+            let watchdogClock = self.clock
+            let stallLimit = self.stallTimeout
+            let firstBufferLimit = self.firstBufferTimeout
             progressTask = Task { @MainActor [weak self, writer] in
                 while !Task.isCancelled {
-                    try? await Task.sleep(for: .milliseconds(200))
-                    guard let self, self.generation == token, self.isRecording else { return }
+                    try? await watchdogClock.sleep(.milliseconds(200))
+                    guard let self, self.generation == token, self.isRecording, !Task.isCancelled else { return }
                     let progress = writer.progress
                     self.elapsed = Double(progress.frames) / self.sampleRate
+                    self.discontinuityCount = progress.discontinuities
                     if let first = progress.firstHostTime { self.hostTime = first }
-                    if let last = progress.lastArrivalUptime,
-                       ProcessInfo.processInfo.systemUptime - last > 2 {
-                        await self.interrupt("Microphone audio stopped arriving. Recording paused; resume explicitly after checking the input.")
+                    if let last = progress.lastArrivalUptime, watchdogClock.uptime() - last > stallLimit {
+                        await self.interrupt(.stalled)
                         return
                     }
                     if progress.lastArrivalUptime == nil,
-                       ProcessInfo.processInfo.systemUptime - progress.startedUptime > 3 {
-                        await self.interrupt("The microphone supplied no audio. Recording paused; check the input and resume explicitly.")
+                       watchdogClock.uptime() - progress.startedUptime > firstBufferLimit {
+                        await self.interrupt(.noAudio)
                         return
                     }
                 }
@@ -134,15 +174,14 @@ final class AudioCapture {
                 sampleRate: sampleRate, channelCount: channelCount
             )
         } catch {
-            input.removeTap(onBus: 0)
-            inputTapNode = nil
-            engine.stop()
+            source.stop()
             liveBuffer?.close()
             self.liveBuffer = nil
             try? await writer.finish()
             self.writer = nil
-            self.engine = nil
+            self.source = nil
             failureHandler = nil
+            interruptionHandler = nil
             throw error
         }
     }
@@ -176,20 +215,21 @@ final class AudioCapture {
         debugFixtureTask?.cancel()
         debugFixtureTask = nil
         #endif
-        inputTapNode?.removeTap(onBus: 0)
-        inputTapNode = nil
-        engine?.stop()
-        engine = nil
+        source?.stop()
+        source = nil
+        #if DEBUG
+        debugEngine?.stop()
+        debugEngine = nil
+        #endif
         let microphoneStopDuration = microphoneStopStarted.duration(to: .now)
         lastMicrophoneStopMilliseconds = Double(microphoneStopDuration.components.seconds) * 1_000
             + Double(microphoneStopDuration.components.attoseconds) / 1e15
-        for (center, token) in observers { center.removeObserver(token) }
-        observers.removeAll()
         if let activity { ProcessInfo.processInfo.endActivity(activity) }
         activity = nil
         defer {
             let progress = writer.progress
             elapsed = Double(progress.frames) / max(sampleRate, 1)
+            discontinuityCount = progress.discontinuities
             if let firstHostTime = progress.firstHostTime { hostTime = firstHostTime }
             #if DEBUG
             if let configuration = debugFixtureConfiguration {
@@ -232,6 +272,7 @@ final class AudioCapture {
         let token = UUID()
         generation = token
         failureHandler = onFailure
+        interruptionHandler = nil
         let writer = try SegmentedAudioWriter(directory: directory, format: format,
             intervalID: intervalID, startTime: startTime, onCommit: onCommit,
             onFailure: { [weak self] message in
@@ -254,7 +295,7 @@ final class AudioCapture {
         }
         self.writer = writer
         self.liveBuffer = liveBuffer
-        self.engine = engine
+        self.debugEngine = engine
         debugFixtureConfiguration = configuration
         debugFixtureIntervalStart = debugFixtureCursor
         debugFixtureLength = file.length
@@ -330,7 +371,7 @@ final class AudioCapture {
             self.liveBuffer = nil
             try? await writer.finish()
             self.writer = nil
-            self.engine = nil
+            self.debugEngine = nil
             failureHandler = nil
             throw error
         }
@@ -345,10 +386,12 @@ final class AudioCapture {
         return window
     }
 
+    /// A stop that may have lost audio (write failure, overflow, format change, a jump too large to bridge).
     private func interrupt(_ message: String) async {
         guard isRecording || writer != nil else { return }
         let handler = failureHandler
         failureHandler = nil
+        interruptionHandler = nil
         do {
             try await pause()
             handler?(message)
@@ -357,28 +400,27 @@ final class AudioCapture {
         }
     }
 
-    private func observeInterruptions(engine: AVAudioEngine, token: UUID) {
-        let center = NotificationCenter.default
-        let configuration = center.addObserver(
-            forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil
-        ) { [weak self] _ in
-            // Engine teardown is asynchronous, outside AVAudioEngine's internal callback.
-            Task { @MainActor in
-                guard let self, self.generation == token else { return }
-                await self.interrupt("The microphone configuration changed. Recording paused; inspect the gap and resume explicitly.")
-            }
+    /// A stop that loses nothing already accepted: drain the writer, then report a pausable take. When the drain
+    /// itself fails, audio may be missing after all, so that reports as a failure instead.
+    private func interrupt(_ interruption: CaptureInterruption) async {
+        guard isRecording || writer != nil else { return }
+        let failure = failureHandler
+        let handler = interruptionHandler
+        failureHandler = nil
+        interruptionHandler = nil
+        do {
+            try await pause()
+            if let handler { handler(interruption) } else { failure?(interruption.message) }
+        } catch {
+            failure?("\(interruption.message) \(error.localizedDescription)")
         }
-        observers.append((center, configuration))
-        let workspace = NSWorkspace.shared.notificationCenter
-        let sleep = workspace.addObserver(
-            forName: NSWorkspace.willSleepNotification, object: nil, queue: nil
-        ) { [weak self] _ in
-            Task { @MainActor in
-                guard let self, self.generation == token else { return }
-                await self.interrupt("The Mac is going to sleep. Recording paused; resume explicitly after waking.")
-            }
+    }
+
+    private func handle(_ event: CaptureSourceEvent) async {
+        switch event {
+        case .configurationChanged: await interrupt(.routeChanged)
+        case .willSleep: await interrupt(.systemSleep)
         }
-        observers.append((workspace, sleep))
     }
 }
 
@@ -405,7 +447,17 @@ final class SegmentedAudioWriter: @unchecked Sendable {
         var firstHostTime: UInt64?
         var lastArrivalUptime: Double?
         var startedUptime = ProcessInfo.processInfo.systemUptime
+        /// Sample gaps, overlaps and clock jumps bridged without ending the take.
+        var discontinuities = 0
+        /// Frames the source skipped across bridged gaps. They are absent from the saved audio.
+        var skippedFrames: Int64 = 0
     }
+
+    /// A sample gap or clock jump up to this long is bridged; the take goes on and the jitter is counted.
+    /// A longer one means real audio is missing, so capture stops rather than splice speech together.
+    static let maximumBridgedDiscontinuity: Double = 1
+    /// Host-clock drift this small against the sample clock is ordinary jitter and is not counted.
+    static let driftTolerance: Double = 0.05
 
     private struct Admission {
         var accepting = true
@@ -417,7 +469,8 @@ final class SegmentedAudioWriter: @unchecked Sendable {
     }
 
     private let queue = DispatchQueue(label: "Keystorm.audio-writer", qos: .userInitiated)
-    private let admission = OSAllocatedUnfairLock(initialState: Admission())
+    private let admission: OSAllocatedUnfairLock<Admission>
+    private let uptime: @Sendable () -> Double
     private let directory: URL
     private let format: AVAudioFormat
     private let intervalID: UUID
@@ -426,6 +479,9 @@ final class SegmentedAudioWriter: @unchecked Sendable {
     private let maximumBufferedFrames: Int64
     private let onCommit: @Sendable (AudioSegment) -> Void
     private let onFailure: @Sendable (String) -> Void
+    /// Called instead of `onFailure` when a buffer arrives in a different format than the writer was opened with.
+    private let onFormatChange: (@Sendable () -> Void)?
+    private static let formatChangeSignal = "keystorm.capture.format-change"
     // Queue-confined state.
     private var file: AVAudioFile?
     private var segmentID: UUID?
@@ -434,12 +490,16 @@ final class SegmentedAudioWriter: @unchecked Sendable {
     private var writeFailure: String?
 
     var progress: Progress { admission.withLock { $0.progress } }
+    /// Frames accepted but not yet written. A file reader waits on this instead of overrunning the buffer.
+    var pendingFrames: Int64 { admission.withLock { $0.pendingFrames } }
 
     init(
         directory: URL, format: AVAudioFormat, intervalID: UUID, startTime: Double,
         segmentSeconds: Double = 5, maximumBufferedSeconds: Double = 10,
+        uptime: @escaping @Sendable () -> Double = { ProcessInfo.processInfo.systemUptime },
         onCommit: @escaping @Sendable (AudioSegment) -> Void,
-        onFailure: @escaping @Sendable (String) -> Void
+        onFailure: @escaping @Sendable (String) -> Void,
+        onFormatChange: (@Sendable () -> Void)? = nil
     ) throws {
         guard format.sampleRate.isFinite, format.sampleRate > 0, format.channelCount > 0,
               startTime.isFinite, startTime >= 0,
@@ -450,10 +510,13 @@ final class SegmentedAudioWriter: @unchecked Sendable {
         self.format = format
         self.intervalID = intervalID
         self.startTime = startTime
+        self.uptime = uptime
+        admission = OSAllocatedUnfairLock(initialState: Admission(progress: Progress(startedUptime: uptime())))
         targetFrames = max(1, Int64(format.sampleRate * segmentSeconds))
         maximumBufferedFrames = max(1, Int64(format.sampleRate * maximumBufferedSeconds))
         self.onCommit = onCommit
         self.onFailure = onFailure
+        self.onFormatChange = onFormatChange
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     }
 
@@ -464,15 +527,17 @@ final class SegmentedAudioWriter: @unchecked Sendable {
             guard frames > 0 else { return nil }
             let failure: String?
             if !buffer.format.isEqual(format) {
+                if onFormatChange != nil {
+                    // The input was swapped under the tap. Everything accepted so far is intact, so stop admitting
+                    // without recording a failure; capture pauses like any other route change.
+                    state.accepting = false
+                    return Self.formatChangeSignal
+                }
                 failure = "The microphone format changed mid-recording. Recording stopped to preserve an explicit discontinuity."
             } else if timestamp.sampleTime == nil || timestamp.hostTime == nil {
                 failure = "The microphone supplied audio without a usable monotonic timestamp. Recording stopped."
-            } else if let expected = state.expectedSampleTime, timestamp.sampleTime != expected {
-                failure = "A microphone sample gap or overlap was detected. Recording stopped; the missing interval requires review."
-            } else if let expected = state.expectedHostSeconds,
-                      let actual = timestamp.hostTime,
-                      abs(AVAudioTime.seconds(forHostTime: actual) - expected) > 0.05 {
-                failure = "A microphone clock discontinuity was detected. Recording stopped."
+            } else if let discontinuity = bridgeDiscontinuity(&state, timestamp: timestamp) {
+                failure = discontinuity
             } else if frames > maximumBufferedFrames - state.pendingFrames {
                 failure = "The audio writer could not keep up. Recording stopped before silently dropping queued audio."
             } else {
@@ -490,7 +555,7 @@ final class SegmentedAudioWriter: @unchecked Sendable {
             }
             state.progress.frames += frames
             if state.progress.firstHostTime == nil { state.progress.firstHostTime = timestamp.hostTime }
-            state.progress.lastArrivalUptime = ProcessInfo.processInfo.systemUptime
+            state.progress.lastArrivalUptime = uptime()
             // Enqueue under the admission lock so finish is ordered after every accepted buffer.
             queue.async { [self, buffer] in
                 autoreleasepool {
@@ -513,7 +578,34 @@ final class SegmentedAudioWriter: @unchecked Sendable {
             }
             return nil
         }
-        if let reportedFailure { onFailure(reportedFailure) }
+        if reportedFailure == Self.formatChangeSignal, let onFormatChange { onFormatChange() }
+        else if let reportedFailure { onFailure(reportedFailure) }
+    }
+
+    /// Compares this buffer's timestamps with where the previous one ended. Jitter that stays within
+    /// `maximumBridgedDiscontinuity` is counted and absorbed, because the saved audio stays usable and the take can
+    /// still finish; anything longer returns the reason capture must stop. Runs under the admission lock.
+    private func bridgeDiscontinuity(_ state: inout Admission, timestamp: CaptureTimestamp) -> String? {
+        var gapSeconds = 0.0
+        var skipped: Int64 = 0
+        var counted = false
+        if let expected = state.expectedSampleTime, let actual = timestamp.sampleTime, actual != expected {
+            // A positive difference is frames the source never delivered; a negative one is a rewind or overlap.
+            let difference = actual - expected
+            gapSeconds = abs(Double(difference)) / format.sampleRate
+            skipped = max(0, difference)
+            counted = true
+        } else if let expected = state.expectedHostSeconds, let actual = timestamp.hostTime {
+            let drift = abs(AVAudioTime.seconds(forHostTime: actual) - expected)
+            if drift > Self.driftTolerance { gapSeconds = drift; counted = true }
+        }
+        guard counted else { return nil }
+        guard gapSeconds <= Self.maximumBridgedDiscontinuity else {
+            return "A microphone sample gap or overlap was detected. Recording stopped; the missing interval requires review."
+        }
+        state.progress.discontinuities += 1
+        state.progress.skippedFrames += skipped
+        return nil
     }
 
     func finish() async throws {

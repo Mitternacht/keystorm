@@ -68,6 +68,7 @@ struct LearningAccuracyHeldOutTests {
 
     @Test("Frozen independent held-out learning accuracy and two-session application",
           .enabled(if: ProcessInfo.processInfo.environment["KEYSTORM_RUN_LEARNING_HELDOUT"] == "1"),
+          .exclusiveModelUse,
           .timeLimit(.minutes(60)))
     func installedModelHeldOutCorpus() async throws {
         let fixtureURL = URL(fileURLWithPath: #filePath).deletingLastPathComponent()

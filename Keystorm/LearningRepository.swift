@@ -150,6 +150,11 @@ actor LearningRepository {
 
     func snapshot() -> LearningDictionarySnapshot { value }
 
+    /// The manual vocabulary sits next to this store so a temporary store root isolates both.
+    nonisolated var vocabularyURL: URL {
+        url.deletingLastPathComponent().appendingPathComponent("vocabulary-v1.json")
+    }
+
     func setEnabled(_ enabled: Bool) throws {
         var next = value
         next.isEnabled = enabled
@@ -505,7 +510,8 @@ actor LearningRepository {
         DictationTransformPolicy.sourceDigest(value.lowercased())
     }
 
-    private static func atomicWrite(_ data: Data, _ target: URL) throws {
+    /// Shared by the manual vocabulary file, which lives beside this one.
+    static func atomicWrite(_ data: Data, _ target: URL) throws {
         let directory = target.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700])
@@ -542,6 +548,11 @@ final class LearningDictionaryController {
     private(set) var externalCorrectionConsentGeneration = UUID()
     private(set) var originSummaries: [UUID: LearningEvidenceOriginSummary] = [:]
     private(set) var entries: [LearnedTerm] = []
+    /// Words the person added by hand. They apply with learning off and need no approval step.
+    private(set) var vocabulary: [VocabularyEntry] = []
+    private(set) var vocabularyErrorMessage: String?
+    /// The last import or export outcome, shown beside those buttons until the vocabulary changes again.
+    private(set) var vocabularyStatusMessage: String?
     private(set) var isClassifying = false
     private(set) var status = ""
     private(set) var errorMessage: String?
@@ -551,6 +562,7 @@ final class LearningDictionaryController {
     /// before the view reacts must not turn this report into an older status, or into silence.
     private(set) var announcement: String?
     @ObservationIgnored private let repository: LearningRepository
+    @ObservationIgnored private let vocabularyStore: ManualVocabularyStore
     @ObservationIgnored private let classifier: @MainActor (CorrectionEvidence) async throws -> CorrectionClassificationReceipt
     @ObservationIgnored private var classificationTask: Task<Void, Never>?
     @ObservationIgnored private var classificationEventID: UUID?
@@ -559,6 +571,7 @@ final class LearningDictionaryController {
     init(repository: LearningRepository,
          classifier: @escaping @MainActor (CorrectionEvidence) async throws -> CorrectionClassificationReceipt) {
         self.repository = repository
+        self.vocabularyStore = ManualVocabularyStore(url: repository.vocabularyURL)
         self.classifier = classifier
     }
 
@@ -575,6 +588,10 @@ final class LearningDictionaryController {
             return (entry.id, summary)
         })
         entries = snapshot.terms.sorted { $0.updatedAt > $1.updatedAt }
+        do {
+            vocabulary = try await vocabularyStore.entries()
+            vocabularyErrorMessage = nil
+        } catch { vocabularyErrorMessage = error.localizedDescription }
     }
 
     func setEnabled(_ enabled: Bool) async {
@@ -701,6 +718,75 @@ final class LearningDictionaryController {
 
     func suggestions(for text: String, appBundleID: String?) async -> [LearnedTermSuggestion] {
         await repository.suggestions(for: text, appBundleID: appBundleID)
+    }
+
+    /// Learned spellings first, then the manual vocabulary on that result. The vocabulary does not
+    /// depend on the learning switch, and a damaged vocabulary file never blocks a dictation.
+    func applyDictionaries(to text: String, appBundleID: String?) async -> LearnedTermApplication {
+        let suggestions = await repository.suggestions(for: text, appBundleID: appBundleID)
+        let learned = LearnedTermApplicator.apply(suggestions: suggestions, to: text)
+        guard !Task.isCancelled, let words = try? await vocabularyStore.entries(), !words.isEmpty else { return learned }
+        let manual = ManualVocabularyApplicator.apply(entries: words, to: learned.text,
+            maximumTerms: max(0, 64 - learned.termIDs.count))
+        guard !manual.termIDs.isEmpty else { return learned }
+        return LearnedTermApplication(text: manual.text, termIDs: learned.termIDs + manual.termIDs)
+    }
+
+    /// Returns whether the word was saved, so the form can keep the person's text on failure.
+    func addVocabularyWord(_ word: String, soundsLike: [String]) async -> Bool {
+        do {
+            try await vocabularyStore.add(word: word, soundsLike: soundsLike)
+            await refresh()
+            errorMessage = nil
+            vocabularyStatusMessage = nil
+            return true
+        } catch { reportError(error); return false }
+    }
+
+    func updateVocabularyEntry(id: UUID, word: String, soundsLike: [String]) async -> Bool {
+        do {
+            try await vocabularyStore.update(id: id, word: word, soundsLike: soundsLike)
+            await refresh()
+            errorMessage = nil
+            vocabularyStatusMessage = nil
+            return true
+        } catch { reportError(error); return false }
+    }
+
+    func deleteVocabularyEntry(id: UUID) async {
+        do {
+            try await vocabularyStore.remove(id: id)
+            await refresh()
+            errorMessage = nil
+            vocabularyStatusMessage = nil
+        } catch { reportError(error) }
+    }
+
+    /// Plain text, one entry per line: `Word` or `spoken one, spoken two => Word`.
+    func importVocabulary(from url: URL) async {
+        let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? Int.max
+        guard size <= VocabularyPolicy.maxImportBytes,
+              let text = try? String(contentsOf: url, encoding: .utf8) else {
+            reportError(VocabularyError.unreadableFile)
+            return
+        }
+        do {
+            let summary = try await vocabularyStore.importText(text)
+            await refresh()
+            let message = String(localized: "Imported \(summary.added) new, updated \(summary.merged), skipped \(summary.skipped).")
+            vocabularyStatusMessage = message
+            reportStatus(message)
+        } catch { reportError(error) }
+    }
+
+    func exportVocabulary(to url: URL) async {
+        do {
+            let text = try await vocabularyStore.exportText()
+            try text.write(to: url, atomically: true, encoding: .utf8)
+            let message = String(localized: "Exported your vocabulary.")
+            vocabularyStatusMessage = message
+            reportStatus(message)
+        } catch { reportError(error) }
     }
 
     /// Reports an outcome; it replaces any earlier error.

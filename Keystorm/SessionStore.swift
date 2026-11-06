@@ -4,8 +4,39 @@ import CryptoKit
 import Darwin
 import AVFoundation
 
+/// A capacity rejection is issued before beginning the journal transaction, so a
+/// caller may reconcile its provisional UI state with the last durable snapshot.
+enum SessionMetadataCapacityError: LocalizedError, Equatable {
+    case incrementalLimitReached
+    case snapshotLimitReached
+
+    var errorDescription: String? {
+        switch self {
+        case .incrementalLimitReached:
+            "Session metadata is full. Pause and export this recording, then start another before adding more material."
+        case .snapshotLimitReached:
+            "Session metadata exceeds the 64 MB storage limit. Export or start another brief before adding more material."
+        }
+    }
+}
+
 /// Single-writer catalog. Audio is committed by the recorder before this actor acknowledges it.
 actor SessionStore {
+    static let maximumSnapshotBytes = 64 * 1_024 * 1_024
+    // This is the largest incremental budget. A session with many open intervals
+    // reserves more for ordinary Pause; arbitrary future edits/error text must
+    // still pass the full-save hard cap.
+    static let maximumIncrementalMetadataBytes = maximumSnapshotBytes - 4_096
+
+    static func incrementalMetadataLimit(for session: VoiceSession) -> Int {
+        let openIntervals = session.intervals.lazy.filter { $0.endedAt == nil }.count
+        let recordingTakes = session.brief?.takes.lazy.filter { $0.status == .recording }.count ?? 0
+        // An interval gains endedAt and may grow hostTime from 0 to UInt64.max.
+        // Each dictation take can grow an updatedAt number; its paused status and
+        // removal of failureMessage do not grow. Root dates/revision have slack.
+        let reserve = max(4_096, 256 + 96 * openIntervals + 64 * recordingTakes)
+        return max(0, maximumSnapshotBytes - reserve)
+    }
     private let root: URL
     private let catalog: SQLiteCatalog
     private let encoder = JSONEncoder()
@@ -39,6 +70,8 @@ actor SessionStore {
         var segmentsByID: [UUID: AudioSegment]
         var dataVersion: Int32
         var stamp: SnapshotStamp?
+        var metadataUpperBound: Int
+        var metadataLimit: Int
     }
 
     private struct Snapshot: Codable {
@@ -194,7 +227,7 @@ actor SessionStore {
 
     /// Snapshot rename precedes SQLite commit. Recovery chooses the higher monotonic revision.
     /// Neither the database transaction nor JSON snapshot is claimed to commit the audio itself.
-    func save(_ session: VoiceSession) throws {
+    func save(_ session: VoiceSession, reservingPauseMetadata: Bool = false) throws {
         // Invalidate before any publication attempt: JSON may succeed even when SQL fails.
         appendCache = nil
         guard session.schemaVersion == 1 else { throw KeystormError.message("Unsupported session schema \(session.schemaVersion).") }
@@ -221,8 +254,13 @@ actor SessionStore {
         }
         let snapshot = Snapshot(revision: (previous?.revision ?? 0) + 1, session: session)
         let data = try encoder.encode(snapshot)
-        guard data.count <= 64 * 1_024 * 1_024 else {
-            throw KeystormError.message("Session metadata exceeds the 64 MB storage limit. Export or start another brief before adding more material.")
+        guard data.count <= Self.maximumSnapshotBytes else {
+            throw SessionMetadataCapacityError.snapshotLimitReached
+        }
+        // A speech mutation may need a full checkpoint to reconcile pending edits.
+        // Its encoding choice must not consume the space needed to close capture.
+        if reservingPauseMetadata, data.count > Self.incrementalMetadataLimit(for: session) {
+            throw SessionMetadataCapacityError.incrementalLimitReached
         }
         try DurableFile.replace(data, at: sessionDirectory(session.id).appendingPathComponent("session.json"))
         try catalog.putSession(id: session.id, revision: snapshot.revision, payload: encoder.encode(session), snapshotStamp: snapshotStampValue(session.id))
@@ -236,6 +274,100 @@ actor SessionStore {
               updatedAt.timeIntervalSinceReferenceDate.isFinite else {
             throw KeystormError.message("The captured audio batch has invalid identities or bounds.")
         }
+        try prepareAppendCache(sessionID)
+        guard let baseline = appendCache?.snapshot else {
+            throw KeystormError.message("The recording checkpoint is unavailable.")
+        }
+        var fresh: [AudioSegment] = []
+        for segment in segments {
+            if let existing = appendCache?.segmentsByID[segment.id] {
+                guard existing == segment else {
+                    throw KeystormError.message("An acknowledged capture identity cannot be rewritten.")
+                }
+            } else { fresh.append(segment) }
+        }
+        guard !fresh.isEmpty else { return baseline.session }
+        try validateCaptureOwnership(fresh, in: baseline.session)
+        let directory = try audioDirectory(sessionID)
+        for segment in fresh {
+            _ = try audioURL(for: segment, in: sessionID)
+            try validatePublicationSegment(segment, in: directory)
+        }
+        guard baseline.revision < Int64.max else {
+            throw KeystormError.message("The session revision limit has been reached.")
+        }
+        let proposal = IncrementalSessionJournal.CaptureDelta(sessionID: sessionID,
+            revision: baseline.revision + 1, segments: fresh, updatedAt: updatedAt)
+        let metadataUpperBound = try metadataBudget(after: encoder.encode(proposal).count, baseline: baseline) {
+            var candidate = baseline.session
+            candidate.segments.append(contentsOf: fresh)
+            candidate.invalidateDerivedWork()
+            candidate.updatedAt = updatedAt
+            return candidate
+        }
+        let delta = try catalog.appendCapture(sessionID: sessionID, expectedRevision: baseline.revision,
+            segments: fresh, updatedAt: updatedAt)
+        // All fallible work precedes the in-memory publication. SQL owns duplicate/range
+        // validation; the cache is updated only after its FULL-synchronous commit.
+        guard var cache = appendCache else { preconditionFailure("Capture cache lost inside serialized storage") }
+        appendCache = nil
+        if let last = cache.snapshot.session.segments.last, let first = delta.segments.first,
+           last.startTime > first.startTime {
+            cache.snapshot.session.segments.append(contentsOf: delta.segments)
+            cache.snapshot.session.segments.sort { $0.startTime < $1.startTime }
+        } else {
+            cache.snapshot.session.segments.append(contentsOf: delta.segments)
+        }
+        for segment in delta.segments { cache.segmentsByID[segment.id] = segment }
+        cache.snapshot.session.invalidateDerivedWork()
+        cache.snapshot.session.updatedAt = delta.updatedAt
+        cache.snapshot.revision = delta.revision
+        cache.metadataUpperBound = metadataUpperBound
+        appendCache = cache
+        return cache.snapshot.session
+    }
+
+    /// Persists only one speech job transition and its newly appended output. The
+    /// source checkpoint is unchanged until a deliberate full metadata save.
+    func saveTranscriptionUpdate(_ session: VoiceSession) throws {
+        try prepareAppendCache(session.id)
+        guard let baseline = appendCache?.snapshot else {
+            throw KeystormError.message("The transcription checkpoint is unavailable.")
+        }
+        guard Set(session.segments.map(\.id)).count == session.segments.count,
+              Set(session.transcripts.map(\.id)).count == session.transcripts.count else {
+            throw KeystormError.message("Duplicate source record identities cannot be committed.")
+        }
+        // Preserve byte-exact original text, including canonically equivalent Unicode.
+        try preserveOriginals(baseline.session, in: session)
+        var normalized = session
+        normalized.updatedAt = baseline.session.updatedAt
+        if baseline.session == normalized { return }
+        let change = try IncrementalSessionJournal.TranscriptionChange.between(baseline.session, and: session)
+        guard baseline.revision < Int64.max else {
+            throw KeystormError.message("The session revision limit has been reached.")
+        }
+        let delta = IncrementalSessionJournal.CaptureDelta(version: 2, sessionID: session.id,
+            revision: baseline.revision + 1, segments: [], updatedAt: session.updatedAt, transcription: change)
+        // Unusual large outputs remain supported by the existing bounded full-save
+        // path; never split one logical output across independently visible commits.
+        let deltaBytes = try encoder.encode(delta).count
+        let metadataUpperBound = try metadataBudget(after: deltaBytes, baseline: baseline) { session }
+        if deltaBytes > IncrementalSessionJournal.maximumDeltaBytes {
+            try save(session)
+            return
+        }
+        let committed = try catalog.appendTranscription(sessionID: session.id,
+            expectedRevision: baseline.revision, change: change, updatedAt: session.updatedAt)
+        guard var cache = appendCache else { preconditionFailure("Transcription cache lost inside serialized storage") }
+        appendCache = nil
+        cache.snapshot.session = session
+        cache.snapshot.revision = committed.revision
+        cache.metadataUpperBound = metadataUpperBound
+        appendCache = cache
+    }
+
+    private func prepareAppendCache(_ sessionID: UUID) throws {
         let stamp = try snapshotStamp(sessionID)
         let dataVersion = try catalog.dataVersion()
         let durableRevision = try catalog.captureRevision(sessionID)
@@ -255,45 +387,32 @@ actor SessionStore {
             }
             appendCache = CaptureCache(snapshot: entry,
                 segmentsByID: Dictionary(uniqueKeysWithValues: entry.session.segments.map { ($0.id, $0) }),
-                dataVersion: try catalog.dataVersion(), stamp: try snapshotStamp(sessionID))
+                dataVersion: try catalog.dataVersion(), stamp: try snapshotStamp(sessionID),
+                metadataUpperBound: try encoder.encode(entry).count,
+                metadataLimit: Self.incrementalMetadataLimit(for: entry.session))
         }
-        guard let baseline = appendCache?.snapshot else {
-            throw KeystormError.message("The recording checkpoint is unavailable.")
+    }
+
+    /// The delta encodes every new/replacement record and more envelope data than
+    /// the checkpoint gains. The extra allowance covers revision/date growth, the
+    /// brief's appended transcript UUID, and true-to-false fact flags. Near capacity,
+    /// rebase to the exact candidate size so conservative charges never reject a
+    /// session that still fits. Normal tiny appends never encode the full history.
+    private func metadataBudget(after deltaBytes: Int, baseline: Snapshot,
+                                candidate: () -> VoiceSession) throws -> Int {
+        guard let current = appendCache?.metadataUpperBound,
+              let limit = appendCache?.metadataLimit else {
+            throw KeystormError.message("The recording metadata budget is unavailable.")
         }
-        var fresh: [AudioSegment] = []
-        for segment in segments {
-            if let existing = appendCache?.segmentsByID[segment.id] {
-                guard existing == segment else {
-                    throw KeystormError.message("An acknowledged capture identity cannot be rewritten.")
-                }
-            } else { fresh.append(segment) }
+        let allowance = deltaBytes + 128 + baseline.session.facts.count
+        if current <= limit, allowance <= limit - current {
+            return current + allowance
         }
-        guard !fresh.isEmpty else { return baseline.session }
-        try validateCaptureOwnership(fresh, in: baseline.session)
-        let directory = try audioDirectory(sessionID)
-        for segment in fresh {
-            _ = try audioURL(for: segment, in: sessionID)
-            try validatePublicationSegment(segment, in: directory)
+        let exact = try encoder.encode(Snapshot(revision: baseline.revision + 1, session: candidate())).count
+        guard exact <= limit else {
+            throw SessionMetadataCapacityError.incrementalLimitReached
         }
-        let delta = try catalog.appendCapture(sessionID: sessionID, expectedRevision: baseline.revision,
-            segments: fresh, updatedAt: updatedAt)
-        // All fallible work precedes the in-memory publication. SQL owns duplicate/range
-        // validation; the cache is updated only after its FULL-synchronous commit.
-        guard var cache = appendCache else { preconditionFailure("Capture cache lost inside serialized storage") }
-        appendCache = nil
-        if let last = cache.snapshot.session.segments.last, let first = delta.segments.first,
-           last.startTime > first.startTime {
-            cache.snapshot.session.segments.append(contentsOf: delta.segments)
-            cache.snapshot.session.segments.sort { $0.startTime < $1.startTime }
-        } else {
-            cache.snapshot.session.segments.append(contentsOf: delta.segments)
-        }
-        for segment in delta.segments { cache.segmentsByID[segment.id] = segment }
-        cache.snapshot.session.invalidateDerivedWork()
-        cache.snapshot.session.updatedAt = delta.updatedAt
-        cache.snapshot.revision = delta.revision
-        appendCache = cache
-        return cache.snapshot.session
+        return exact
     }
 
     private func validateCaptureOwnership(_ segments: [AudioSegment], in session: VoiceSession) throws {
@@ -530,6 +649,84 @@ actor SessionStore {
         return (reports, blocked)
     }
 
+    // MARK: Dictation history search, deletion and retention
+
+    /// Matches saved dictations by title and transcript text, newest first.
+    func searchHistory(_ query: String, limit: Int = 50) throws -> [DictationHistoryHeader] {
+        try catalog.withHistory { try $0.search(query, limit: limit) }
+    }
+
+    /// Every session that owns an indexed dictation. Developer briefs are not included.
+    func dictationSessionIDs(limit: Int = 500) throws -> [UUID] {
+        try catalog.withHistory { try $0.dictationSessionIDs(limit: limit) }
+    }
+
+    /// Finished dictation sessions whose newest take is older than `cutoff`. A session that is capturing,
+    /// paused, captured or processing is never listed.
+    func finishedDictationSessionIDs(newestBefore cutoff: Date, readyOnly: Bool = false, limit: Int = 200) throws -> [UUID] {
+        try catalog.withHistory { try $0.finishedSessionIDs(newestBefore: cutoff, readyOnly: readyOnly, limit: limit) }
+    }
+
+    /// Permanently removes one session: its folder with audio and checkpoint, its catalog payload, capture
+    /// journal and history index rows. The folder is renamed out of Sessions first, so a failed catalog
+    /// transaction restores it and a failed final delete cannot make recovery adopt it again.
+    func deleteSession(_ id: UUID) throws {
+        appendCache = nil
+        let directory = root.appendingPathComponent("Sessions", isDirectory: true)
+            .appendingPathComponent(id.uuidString, isDirectory: true)
+        try requireContained(directory)
+        let graveyard = root.appendingPathComponent(".pending-deletion", isDirectory: true)
+        var moved: URL?
+        var attributes = stat()
+        if lstat(directory.path, &attributes) == 0 {
+            try FileManager.default.createDirectory(at: graveyard, withIntermediateDirectories: true)
+            let target = graveyard.appendingPathComponent(id.uuidString + "-" + UUID().uuidString, isDirectory: true)
+            try FileManager.default.moveItem(at: directory, to: target)
+            moved = target
+        }
+        do { try catalog.deleteSession(id) }
+        catch {
+            if let moved { try? FileManager.default.moveItem(at: moved, to: directory) }
+            throw error
+        }
+        // Best effort: leftovers are outside Sessions, so nothing reads them, and the next deletion retries.
+        for leftover in (try? FileManager.default.contentsOfDirectory(at: graveyard, includingPropertiesForKeys: nil)) ?? [] {
+            try? FileManager.default.removeItem(at: leftover)
+        }
+    }
+
+    /// Deletes a finished dictation's audio files but keeps its transcript and history entry. The audio is
+    /// recorded as unavailable with the same gap text recovery writes for a missing file, so opening the
+    /// recording later changes nothing. Returns the updated session, or nil when there was nothing safe to do.
+    func discardAudio(sessionID id: UUID) throws -> VoiceSession? {
+        appendCache = nil
+        // Reading a session by identity creates its folder, so an unknown identity is ruled out first.
+        let directory = root.appendingPathComponent("Sessions", isDirectory: true)
+            .appendingPathComponent(id.uuidString, isDirectory: true)
+            .appendingPathComponent("Audio", isDirectory: true)
+        try requireContained(directory)
+        guard FileManager.default.fileExists(atPath: directory.path), let entry = try currentEntry(id) else { return nil }
+        var session = entry.session
+        guard session.status != .recording, !session.segments.isEmpty,
+              let recordings = session.dictation?.recordings, !recordings.isEmpty,
+              recordings.allSatisfy({ $0.state == .ready }) else { return nil }
+        let files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        guard !files.isEmpty else { return nil }
+        for file in files {
+            try requireContained(file)
+            try FileManager.default.removeItem(at: file)
+        }
+        var unavailable = Set(session.unavailableSegmentIDs)
+        for segment in session.segments where unavailable.insert(segment.id).inserted {
+            addGap("Audio \(segment.id.uuidString) is unavailable: File is missing.", to: &session,
+                   from: segment.committedAt, segmentIDs: [segment.id], intervalIDs: [segment.intervalID])
+        }
+        session.unavailableSegmentIDs = unavailable.sorted { $0.uuidString < $1.uuidString }
+        session.updatedAt = Date()
+        try save(session)
+        return session
+    }
+
     func loadDictionary() throws -> [DictionaryEntry] {
         guard let data = try catalog.metadata("dictionary") else { return [] }
         return try decoder.decode([DictionaryEntry].self, from: data)
@@ -565,9 +762,15 @@ actor SessionStore {
             guard var entry = loaded.entries[id] else { continue }
             var session = entry.session
             let original = session
+            var deferredInterruptionGap: Date?
             if session.status == .recording {
                 session.status = .interrupted
-                addGap("Recording was interrupted. Audio after the last acknowledged segment may be missing.", to: &session, from: session.updatedAt)
+                if session.dictation == nil {
+                    addGap("Recording was interrupted. Audio after the last acknowledged segment may be missing.", to: &session, from: session.updatedAt)
+                } else {
+                    // A dictation can still finish with the audio it saved, so its gap waits until the tail was inspected.
+                    deferredInterruptionGap = session.updatedAt
+                }
                 reports.append("\(session.title): interrupted recording recovered.")
             }
             if var brief = session.brief {
@@ -627,9 +830,25 @@ actor SessionStore {
                     reports.append("\(session.title): \(reason)")
                 }
             }
+            // A crash or force quit leaves the writer's open segment as `<id>.partial.caf`: up to its 5 s rotation of
+            // speech that was never acknowledged. Rebuild each readable tail into a committed segment.
+            var salvagedTails = Set<String>()
+            for tail in files.filter({ $0.lastPathComponent.hasSuffix(Self.partialSuffix) })
+                .sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+                try Task.checkCancellation()
+                let stem = String(tail.lastPathComponent.dropLast(Self.partialSuffix.count))
+                if let tailID = UUID(uuidString: stem), session.segments.contains(where: { $0.id == tailID }) {
+                    // An earlier recovery already committed this tail; only its renamed original may be missing.
+                    salvagedTails.insert(tail.lastPathComponent)
+                    continue
+                }
+                guard let segment = try salvagePartialTail(tail, in: directory, session: &session) else { continue }
+                salvagedTails.insert(tail.lastPathComponent)
+                reports.append("\(session.title): recovered \(String(format: "%.1f", segment.duration)) s of audio from an unfinished segment.")
+            }
             let fileNames = Set(files.map(\.lastPathComponent))
             let committedNames = Set(session.segments.map(\.fileName))
-            for file in files {
+            for file in files where !salvagedTails.contains(file.lastPathComponent) {
                 let isTail = file.pathExtension == "partial" || file.pathExtension == "tmp"
                 let hasNoSidecar = file.pathExtension == "caf" &&
                     !fileNames.contains(file.deletingPathExtension().lastPathComponent + ".json") &&
@@ -638,6 +857,15 @@ actor SessionStore {
                     let reason = "Incomplete audio tail \(file.lastPathComponent) retained for inspection; it is not acknowledged audio."
                     addGap(reason, to: &session)
                     reports.append("\(session.title): \(reason)")
+                }
+            }
+            if let interruptedAt = deferredInterruptionGap {
+                if let open = session.intervals.last(where: { $0.endedAt == nil }),
+                   session.segments.contains(where: { $0.intervalID == open.id }) {
+                    // The open interval kept its audio, so the dictation can finish. At most the last moment is missing.
+                    reports.append("\(session.title): saved audio was kept; anything said just before the interruption may be missing.")
+                } else {
+                    addGap("Recording was interrupted. Audio after the last acknowledged segment may be missing.", to: &session, from: interruptedAt)
                 }
             }
             session.segments.sort { $0.startTime < $1.startTime }
@@ -683,6 +911,98 @@ actor SessionStore {
         }) else { return }
         session.gaps.append(SessionGap(startedAt: date ?? session.updatedAt, endedAt: Date(), reason: reason,
                                       segmentIDs: segmentIDs, intervalIDs: intervalIDs))
+    }
+
+    private static let partialSuffix = ".partial.caf"
+    /// The writer rotates segments at 5 s, so a tail much longer than that is not one of its own files.
+    private static let maximumSalvagedTailSeconds = 30.0
+
+    /// Rebuilds a crash-orphaned `<id>.partial.caf` into a committed segment: a finalized CAF, its sidecar, and an
+    /// entry in `session.segments` at the end of the interval that was open when the app died. The original tail is
+    /// kept beside it under a renamed extension. Returns nil, touching nothing, when the tail cannot be read or
+    /// placed without ambiguity, which leaves it to the usual "incomplete tail" gap.
+    private func salvagePartialTail(_ tail: URL, in directory: URL, session: inout VoiceSession) throws -> AudioSegment? {
+        let stem = String(tail.lastPathComponent.dropLast(Self.partialSuffix.count))
+        guard let id = UUID(uuidString: stem), !session.segments.contains(where: { $0.id == id }),
+              let interval = session.intervals.last(where: { $0.endedAt == nil }) else { return nil }
+        let final = directory.appendingPathComponent("\(id.uuidString).caf")
+        let staging = directory.appendingPathComponent("\(id.uuidString).salvage.caf")
+        let sidecar = directory.appendingPathComponent("\(id.uuidString).json")
+        let sidecarStaging = directory.appendingPathComponent("\(id.uuidString).json.tmp")
+        let fileManager = FileManager.default
+        guard !fileManager.fileExists(atPath: final.path), !fileManager.fileExists(atPath: sidecar.path) else { return nil }
+        // Both are this routine's own leftovers from an interrupted earlier attempt.
+        try? fileManager.removeItem(at: staging)
+        try? fileManager.removeItem(at: sidecarStaging)
+
+        let source: AVAudioFile
+        do { source = try AVAudioFile(forReading: tail) } catch { return nil }
+        defer { source.close() }
+        let format = source.processingFormat
+        let siblings = session.segments.filter { $0.intervalID == interval.id }
+        guard source.length > 0, format.sampleRate > 0, format.channelCount > 0,
+              Double(source.length) / format.sampleRate <= Self.maximumSalvagedTailSeconds,
+              siblings.allSatisfy({ abs($0.sampleRate - format.sampleRate) < 0.001 && $0.channelCount == Int(format.channelCount) }),
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 16_384) else { return nil }
+
+        var written: Int64 = 0
+        do {
+            let output = try AVAudioFile(forWriting: staging, settings: source.fileFormat.settings,
+                                         commonFormat: format.commonFormat, interleaved: format.isInterleaved)
+            // A tail that was never closed can end mid-chunk; keep whatever reads cleanly.
+            while source.framePosition < source.length {
+                let remaining = source.length - source.framePosition
+                do { try source.read(into: buffer, frameCount: AVAudioFrameCount(min(Int64(buffer.frameCapacity), remaining))) }
+                catch { break }
+                guard buffer.frameLength > 0 else { break }
+                try output.write(from: buffer)
+                written += Int64(buffer.frameLength)
+            }
+            output.close()
+        } catch {
+            try? fileManager.removeItem(at: staging)
+            return nil
+        }
+        guard written > 0 else {
+            try? fileManager.removeItem(at: staging)
+            return nil
+        }
+
+        // Timeline: right after this interval's last committed audio, or after everything saved so far.
+        let startTime = siblings.map(\.endTime).max() ?? session.recordedDuration
+        do {
+            try CaptureDurability.synchronize(staging)
+            let hash = try CaptureDurability.sha256(staging)
+            let segment = AudioSegment(id: id, intervalID: interval.id, fileName: final.lastPathComponent,
+                startTime: startTime, frameCount: written, sampleRate: format.sampleRate,
+                channelCount: Int(format.channelCount), sha256: hash)
+            guard !session.segments.contains(where: { Self.overlaps($0, segment) }) else {
+                try? fileManager.removeItem(at: staging)
+                return nil
+            }
+            try validateAudio(segment, at: staging)
+            try fileManager.moveItem(at: staging, to: final)
+            do {
+                try JSONEncoder().encode(segment).write(to: sidecarStaging, options: .withoutOverwriting)
+                try CaptureDurability.synchronize(sidecarStaging)
+                try fileManager.moveItem(at: sidecarStaging, to: sidecar)
+                try CaptureDurability.synchronizeDirectory(directory)
+            } catch {
+                // Without its sidecar the new file would look like unexplained audio; take it back.
+                try? fileManager.removeItem(at: sidecarStaging)
+                try? fileManager.removeItem(at: final)
+                return nil
+            }
+            // Keep the original evidence, out of the way of tail detection and of the next recovery.
+            try? fileManager.moveItem(at: tail, to: tail.appendingPathExtension("salvaged"))
+            session.segments.append(segment)
+            return segment
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            try? fileManager.removeItem(at: staging)
+            return nil
+        }
     }
 
     private func validateAudio(_ segment: AudioSegment, sessionID: UUID) throws {
@@ -838,7 +1158,7 @@ actor SessionStore {
         guard Set(result.session.segments.map(\.id)).count == result.session.segments.count else {
             throw KeystormError.message("The capture checkpoint contains duplicate sources.")
         }
-        var known = Set(result.session.segments.map(\.id))
+        var transcriptionState = try IncrementalSessionJournal.TranscriptionReplayState(result.session)
         var ordered = result.session.segments.sorted { $0.startTime < $1.startTime }
         guard zip(ordered, ordered.dropFirst()).allSatisfy({ !Self.overlaps($0.0, $0.1) }) else {
             throw KeystormError.message("The capture checkpoint has conflicting audio ranges.")
@@ -852,11 +1172,14 @@ actor SessionStore {
                 guard delta.revision == result.revision + 1, delta.revision <= expected else {
                     throw KeystormError.message("The capture journal changed during recovery.")
                 }
+                if let change = delta.transcription {
+                    try transcriptionState.apply(change, to: &result.session, updatedAt: delta.updatedAt)
+                    result.revision = delta.revision
+                    continue
+                }
                 try validateCaptureOwnership(delta.segments, in: result.session)
                 for segment in delta.segments {
-                    guard known.insert(segment.id).inserted else {
-                        throw KeystormError.message("The capture journal repeats an immutable source.")
-                    }
+                    try transcriptionState.appendSource(segment)
                     // Binary neighbors suffice because insertion retains sorted disjoint
                     // acknowledged capture ranges. No historical audio file is reread here.
                     var low = 0, high = ordered.count
@@ -870,7 +1193,7 @@ actor SessionStore {
                     }
                     ordered.insert(segment, at: low)
                 }
-                result.session.invalidateDerivedWork()
+                transcriptionState.invalidateDerivedWork(in: &result.session)
                 result.session.updatedAt = delta.updatedAt
                 result.revision = delta.revision
             }
@@ -1064,6 +1387,30 @@ private final class SQLiteCatalog: @unchecked Sendable {
         try DictationHistoryRepository(connection: connection).markRepair(id, reason: reason)
     }
 
+    func withHistory<T>(_ body: (DictationHistoryRepository) throws -> T) throws -> T {
+        guard let connection else { throw failure() }
+        return try body(DictationHistoryRepository(connection: connection))
+    }
+
+    /// One transaction removes the payload, capture journal, history headers and the dictation index rows.
+    func deleteSession(_ id: UUID) throws {
+        guard let connection else { throw failure() }
+        try execute("BEGIN IMMEDIATE")
+        do {
+            for sql in ["DELETE FROM sessions WHERE id=?",
+                        "DELETE FROM session_capture_journal WHERE session_id=?",
+                        "DELETE FROM session_capture_sources WHERE session_id=?",
+                        "DELETE FROM session_history_headers WHERE session_id=?"] {
+                let query = try statement(sql)
+                defer { sqlite3_finalize(query) }
+                try bind(id.uuidString, at: 1, to: query)
+                guard sqlite3_step(query) == SQLITE_DONE else { throw failure() }
+            }
+            try DictationHistoryRepository(connection: connection).forgetSession(id)
+            try execute("COMMIT")
+        } catch { try? execute("ROLLBACK"); throw error }
+    }
+
     func dataVersion() throws -> Int32 { try scalar("PRAGMA data_version") }
 
     func hasCaptureHeader(_ id: UUID) throws -> Bool { try captureHeaderRevision(id) != nil }
@@ -1096,6 +1443,14 @@ private final class SQLiteCatalog: @unchecked Sendable {
         guard let connection else { throw failure() }
         return try IncrementalSessionJournal(connection: connection).append(sessionID: sessionID,
             expectedRevision: expectedRevision, segments: segments, updatedAt: updatedAt)
+    }
+
+    func appendTranscription(sessionID: UUID, expectedRevision: Int64,
+                             change: IncrementalSessionJournal.TranscriptionChange,
+                             updatedAt: Date) throws -> IncrementalSessionJournal.CaptureDelta {
+        guard let connection else { throw failure() }
+        return try IncrementalSessionJournal(connection: connection).append(sessionID: sessionID,
+            expectedRevision: expectedRevision, segments: [], updatedAt: updatedAt, transcription: change)
     }
 
     func containsSession(_ id: UUID) throws -> Bool {

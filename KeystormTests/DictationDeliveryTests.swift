@@ -370,7 +370,9 @@ struct DictationDeliveryTests {
 
 
     @Test("Opt-in: real TextEdit insertion through the production Accessibility/clipboard adapter",
-          .enabled(if: ProcessInfo.processInfo.environment["KEYSTORM_RUN_DICTATION_DELIVERY"] == "1"))
+          .enabled(if: ProcessInfo.processInfo.environment["KEYSTORM_RUN_DICTATION_DELIVERY"] == "1"
+              || (try? String(contentsOfFile: "/tmp/Keystorm-Hardware-validation.flag", encoding: .utf8)
+                  .trimmingCharacters(in: .whitespacesAndNewlines)) == "capture-and-delivery"))
     func nativeTextEditInsertionAndClipboardRestoration() async throws {
         let service = DictationDeliveryService()
         guard service.isAccessibilityTrusted else {
@@ -421,6 +423,10 @@ struct DictationDeliveryTests {
             Issue.record("Native TextEdit capture failed: \(failure.message)")
             return
         }
+        try #require(captured.descriptor.processIdentifier == application.processIdentifier
+            && captured.descriptor.bundleIdentifier == "com.apple.TextEdit",
+            "Focus changed before capture; never deliver the fixture into another application's document.")
+        try #require(captured.strategy == .qualifiedTextEdit)
         let text: String
         if let path = ProcessInfo.processInfo.environment["KEYSTORM_DICTATION_DELIVERY_TEXT_PATH"] {
             text = try String(contentsOfFile: path, encoding: .utf8)
@@ -430,13 +436,35 @@ struct DictationDeliveryTests {
             print("Native delivery input: literal mixed English/German/emoji fixture; no ASR claim.")
         }
         let clipboardBefore = nativeClipboardSnapshot()
+        let deliveryStarted = ContinuousClock.now
         let receipt = await service.deliver(text, to: captured, deliveryID: UUID())
+        let duration = deliveryStarted.duration(to: .now).components
+        let deliveryMilliseconds = Double(duration.seconds) * 1_000
+            + Double(duration.attoseconds) / 1_000_000_000_000_000
         #expect(receipt.outcome == .confirmed, "Production delivery must observe the exact TextEdit result.")
         let value = try nativeString(kAXValueAttribute, of: editor)
-        #expect(value.utf8.elementsEqual((prefix + text).utf8))
+        let exactOutput = value.utf8.elementsEqual((prefix + text).utf8)
+        #expect(exactOutput)
         let clipboardRestored = clipboardBefore == nativeClipboardSnapshot()
         #expect(clipboardRestored, "All original clipboard item representations must be restored after confirmed insertion.")
-        print("Native delivery evidence: outcome=\(receipt.outcome.rawValue), UTF16=\(text.utf16.count), clipboardRestored=\(clipboardRestored)")
+        let evidence: [String: Any] = [
+            "scope": "One real production deliver() call, from invocation through confirmed receipt; excludes target setup, speech, microphone, shortcut and HUD. One observation is not a latency percentile qualification.",
+            "deliveryMilliseconds": deliveryMilliseconds, "outcome": receipt.outcome.rawValue,
+            "exactUTF8Output": exactOutput, "clipboardRestored": clipboardRestored,
+            "disposableTargetPID": application.processIdentifier, "inputUTF16Count": text.utf16.count,
+            "inputSHA256": DictationTransformPolicy.sourceDigest(text)
+        ]
+        let data = try JSONSerialization.data(withJSONObject: evidence, options: [.prettyPrinted, .sortedKeys])
+        Attachment.record(data, named: "native-textedit-delivery.json")
+        if let parent = ProcessInfo.processInfo.environment["KEYSTORM_DICTATION_REPORT_DIRECTORY"]
+            ?? ((try? String(contentsOfFile: "/tmp/Keystorm-Hardware-validation.flag", encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines)) == "capture-and-delivery"
+                ? "/tmp/Keystorm-HardwareEvidence" : nil) {
+            let directory = URL(fileURLWithPath: parent, isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try data.write(to: directory.appendingPathComponent("native-textedit-delivery.json"), options: .atomic)
+        }
+        print("Native delivery evidence: outcome=\(receipt.outcome.rawValue), milliseconds=\(deliveryMilliseconds), UTF16=\(text.utf16.count), clipboardRestored=\(clipboardRestored)")
     }
 
     private func nativeFocusedField(processIdentifier: Int32) throws -> AXUIElement {

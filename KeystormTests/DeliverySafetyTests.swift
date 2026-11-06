@@ -172,6 +172,8 @@ struct DeliverySafetyTests {
     func coordinatorRefusesExcludedAppAtFinish(_ scenario: DeliverySafetyFinishExclusion) async {
         let adapter = DeliverySafetyAdapter(.pasteFallback)
         let preferences = DictationPreferences()
+        // Only the refusal receipt is under test; Copy when not inserted is covered in DictationCoordinatorTests.
+        preferences.copyWhenNotInserted = false
         let backend = DeliverySafetyBackend()
         let coordinator = DictationCoordinator(backend: backend, delivery: DeliverySafetyAdapter.service(adapter),
                                                preferences: preferences)
@@ -206,6 +208,8 @@ struct DeliverySafetyTests {
         let preferences = DictationPreferences()
         preferences.mode = .clean
         preferences.contextMode = .nearbyText
+        // Keeps the user's clipboard untouched; Copy when not inserted is covered in DictationCoordinatorTests.
+        preferences.copyWhenNotInserted = false
         let backend = DeliverySafetyBackend()
         backend.reportsMetadata = true
         let coordinator = DictationCoordinator(backend: backend, delivery: DeliverySafetyAdapter.service(adapter),
@@ -226,7 +230,8 @@ struct DeliverySafetyTests {
         } else {
             #expect(context?.availability == .nearbyText)
         }
-        #expect(adapter.writes == 0, "The transform fails, so nothing is delivered.")
+        // The transform fails, so the raw transcript is inserted, unless the destination was blocked.
+        #expect(adapter.writes == (blockedDuringRecording ? 0 : 1))
     }
 
     // MARK: (c) Moved-element races

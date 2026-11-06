@@ -13,6 +13,7 @@ import os
 struct LiveSpeechPreviewSmokeTests {
     @Test("Installed Ultra supplies bounded early previews through the production worker",
           .enabled(if: ProcessInfo.processInfo.environment["KEYSTORM_RUN_PREVIEW_SMOKE"] == "1"),
+          .exclusiveModelUse,
           .timeLimit(.minutes(5)))
     func installedPreviewRuntime() async throws {
         let models = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
@@ -35,7 +36,8 @@ struct LiveSpeechPreviewSmokeTests {
         let pid = try #require(prepared["workerPID"])
         let verificationCount = await inference.integrityVerificationCount
         #expect(pid > 0 && pid != UInt64(getpid()))
-        #expect(verificationCount == 1)
+        // One hash pass for a model the cache has not seen; none when its recorded hash still matches.
+        #expect(verificationCount <= 1)
         let configuration = try await inference.configuration(for: ModelCatalog.primarySpeech)
         var prefixes: [PreviewPrefixMeasurement] = []
         var firstTextSourceSeconds: Double?
@@ -114,6 +116,7 @@ struct LiveSpeechPreviewSmokeTests {
 
     @Test("Paced synthetic mirror and HUD display early worker previews",
           .enabled(if: ProcessInfo.processInfo.environment["KEYSTORM_RUN_PREVIEW_SMOKE"] == "1"),
+          .exclusiveModelUse,
           .timeLimit(.minutes(5)))
     func pacedMirrorToHUD() async throws {
         try await runPacedMirrorToHUD(inputSampleRate: 16_000, attachmentName: "paced-live-speech-preview-smoke.json")
@@ -121,6 +124,7 @@ struct LiveSpeechPreviewSmokeTests {
 
     @Test("Paced 48 kHz input displays early worker previews after production resampling",
           .enabled(if: ProcessInfo.processInfo.environment["KEYSTORM_RUN_PREVIEW_SMOKE"] == "1"),
+          .exclusiveModelUse,
           .timeLimit(.minutes(5)))
     func paced48kMirrorToHUD() async throws {
         try await runPacedMirrorToHUD(inputSampleRate: 48_000, attachmentName: "paced-48k-live-speech-preview-smoke.json")
@@ -190,7 +194,9 @@ struct LiveSpeechPreviewSmokeTests {
         var displays: [PacedPreviewDisplay] = []
         var failures: [String] = []
         var firstDisplayedMilliseconds: Double?
-        let deadline = start.advanced(by: .seconds(40))
+        // Counted from when the model is ready, not from the start of feeding: a cold model load (or one queued
+        // behind another test's worker) used to eat this window and end the loop before the ring had filled.
+        let deadline = ContinuousClock.now.advanced(by: .seconds(40))
         while ContinuousClock.now < deadline {
             let cycleStarted = ContinuousClock.now
             if let window = await mirror.snapshot(after: sequence) {

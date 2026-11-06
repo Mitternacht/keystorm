@@ -20,10 +20,10 @@ Keystorm is in development. There is no signed or notarized download yet; you ca
 | --- | --- |
 | TextEdit | Inserted and confirmed |
 | Other apps | Pasted after the text field is checked |
-| Terminals | Copy only |
+| Terminals | Copied to the clipboard |
 | Password managers and password fields | Never |
 
-Outside TextEdit, pasting has been tested in Stickies and Dictionary so far; browsers and Electron apps are not verified yet. Keystorm restores your clipboard after a paste when it can, never presses Return, and keeps the result for you to copy if the destination changed while you were talking. You can block any app or website in Settings.
+Outside TextEdit, pasting has been tested in Stickies and Dictionary so far; browsers and Electron apps are not verified yet. Keystorm restores your clipboard after a paste when it can, never presses Return, and puts the result on the clipboard if it could not be inserted, for example because the destination changed while you were talking (Settings → Dictation → Copy when not inserted). You can block any app or website in Settings.
 
 ## Privacy
 

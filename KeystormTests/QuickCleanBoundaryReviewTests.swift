@@ -88,6 +88,8 @@ private final class ReviewCleanRig {
     init() {
         let preferences = DictationPreferences()
         preferences.mode = .clean
+        // Keeps the user's clipboard untouched; Copy when not inserted is covered in DictationCoordinatorTests.
+        preferences.copyWhenNotInserted = false
         coordinator = DictationCoordinator(backend: backend,
             delivery: DictationDeliveryService(adapter: adapter), preferences: preferences)
     }

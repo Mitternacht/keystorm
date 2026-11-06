@@ -202,7 +202,7 @@ struct LazyDictationHistoryTests {
             #expect(try fixture.integer("SELECT count(*) FROM sqlite_master WHERE name='dictation_history'") == 0)
             try DictationHistoryRepository(connection: connection).migrate()
             try DictationHistoryRepository(connection: connection).migrate()
-            #expect(try fixture.integer("PRAGMA user_version") == 4)
+            #expect(try fixture.integer("PRAGMA user_version") == 5)
             let page = try DictationHistoryRepository(connection: connection).page(limit: 50, before: nil)
             #expect(page.entries.map(\.sessionID) == [session.id])
         }
@@ -240,7 +240,7 @@ struct LazyDictationHistoryTests {
 
         let reopened = try SessionStore(root: fixture.root)
         let startup = try await reopened.prepareLazyStartup()
-        #expect(try fixture.integer("PRAGMA user_version") == 4)
+        #expect(try fixture.integer("PRAGMA user_version") == 5)
         #expect(startup.totalSessionCount == 2 && startup.pendingRepairCount == 2)
         #expect(startup.page.entries.count == (missingHeader ? 0 : 1))
         #expect(await reopened.historyQueryDiagnostics().fullPayloadDecodes == 0)
@@ -297,7 +297,7 @@ struct LazyDictationHistoryTests {
             try repository.migrate()
             #expect(try fixture.integer("SELECT value FROM dictation_history_generation") == generation + 1)
         }
-        #expect(try fixture.integer("PRAGMA user_version") == 4)
+        #expect(try fixture.integer("PRAGMA user_version") == 5)
         #expect(try fixture.blob("SELECT payload FROM sessions") == payload)
     }
 
@@ -313,7 +313,7 @@ struct LazyDictationHistoryTests {
         try fixture.sql("PRAGMA user_version=3")
         let reopened = try SessionStore(root: fixture.root)
         let startup = try await reopened.prepareLazyStartup()
-        #expect(try fixture.integer("PRAGMA user_version") == 4)
+        #expect(try fixture.integer("PRAGMA user_version") == 5)
         #expect(startup.pendingRepairCount == 0 && startup.page.entries.map(\.sessionID) == [session.id])
         #expect(try fixture.integer("SELECT value FROM dictation_history_generation") == generation)
         #expect(try fixture.integer("SELECT recording_count FROM dictation_history_checkpoints") == 1)

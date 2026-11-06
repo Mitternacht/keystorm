@@ -36,12 +36,14 @@ struct LegacyWorkspaceView: View {
                     Text("Record naturally. Keep the original. Review a prompt that preserves what you meant.")
                 } actions: {
                     Button("New session") { Task { await model.newSession() } }
-                        .buttonStyle(.borderedProminent).accessibilityIdentifier("newSessionEmpty")
+                        .buttonStyle(.glassProminent).accessibilityIdentifier("newSessionEmpty")
                 }
             }
         }
             .navigationSplitViewStyle(.balanced)
-            Divider()
+        }
+        // A bar, not a stacked footer with a hand-drawn background, so content scrolls under it with the system edge effect.
+        .safeAreaBar(edge: .bottom, spacing: 0) {
             ActivityFooter(model: model)
         }
         .toolbar {
@@ -115,7 +117,7 @@ struct RecordingBar: View {
                 Label(model.isRecording ? "Pause recording" : "Record", systemImage: model.isRecording ? "pause.fill" : "mic.fill")
                     .padding(.horizontal, 7)
             }
-            .buttonStyle(.borderedProminent).tint(model.isRecording ? .red : .accentColor)
+            .buttonStyle(.glassProminent).tint(model.isRecording ? .red : .accentColor)
             .controlSize(.large).accessibilityIdentifier("recordPause")
             VStack(alignment: .leading, spacing: 4) {
                 Text(Duration.seconds(model.elapsed), format: .time(pattern: .hourMinuteSecond))
@@ -615,7 +617,7 @@ struct ActivityFooter: View {
                 .help("Recordings, transcripts, and briefs are processed locally.")
         }
         .font(.caption).foregroundStyle(.secondary)
-        .padding(.horizontal, 16).padding(.vertical, 6).background(.bar)
+        .padding(.horizontal, 16).padding(.vertical, 6)
     }
 }
 

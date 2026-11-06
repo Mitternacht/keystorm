@@ -43,7 +43,7 @@ struct CaptureTests {
         #expect(!files.contains { $0.contains("partial") || $0.hasSuffix(".tmp") })
     }
 
-    @Test func `A clock discontinuity stops admission without concealing the valid prefix`() async throws {
+    @Test func `A discontinuity too long to bridge stops admission without concealing the valid prefix`() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
         let format = try #require(AVAudioFormat(standardFormatWithSampleRate: 16_000, channels: 1))
@@ -54,8 +54,9 @@ struct CaptureTests {
         )
         let samples = try makeCaptureBuffer(format: format, frames: 1_600)
         writer.enqueue(samples, timestamp: timestamp(frame: 0))
-        writer.enqueue(samples, timestamp: timestamp(frame: 3_200))
-        writer.enqueue(samples, timestamp: timestamp(frame: 4_800))
+        // Two seconds of missing samples: beyond what jitter bridging absorbs.
+        writer.enqueue(samples, timestamp: timestamp(frame: 32_000))
+        writer.enqueue(samples, timestamp: timestamp(frame: 33_600))
         await #expect(throws: (any Error).self) { try await writer.finish() }
         #expect(receipts.failures.count == 1)
         #expect(receipts.failures.first?.contains("sample gap") == true)

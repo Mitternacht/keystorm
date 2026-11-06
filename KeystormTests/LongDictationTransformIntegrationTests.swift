@@ -6,6 +6,7 @@ import Testing
 struct LongDictationTransformIntegrationTests {
     @Test("Actual Qwen long summary previews all source sections and persists a reversible output",
         .enabled(if: ProcessInfo.processInfo.environment["KEYSTORM_RUN_LONG_TRANSFORM"] == "1"),
+        .exclusiveModelUse,
         .timeLimit(.minutes(10)))
     func installedLongSummaryApplyReopen() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("Keystorm-LongTransform-\(UUID().uuidString)")

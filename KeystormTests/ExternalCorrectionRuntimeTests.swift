@@ -7,6 +7,7 @@ import Testing
 struct ExternalCorrectionRuntimeTests {
     @Test("Actual destination-origin EN/DE candidates stay Review until approval",
           .enabled(if: ProcessInfo.processInfo.environment["KEYSTORM_RUN_EXTERNAL_CORRECTIONS"] == "1"),
+          .exclusiveModelUse,
           .timeLimit(.minutes(10)))
     func installedModelExternalReviewApproveAndReopen() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("Keystorm-Approval-\(UUID())")

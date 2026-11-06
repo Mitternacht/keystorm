@@ -3,7 +3,7 @@ import Observation
 
 /// The steps of first-run setup, in order.
 enum OnboardingStep: Int, CaseIterable, Identifiable {
-    case models, microphone, accessibility, shortcuts
+    case models, microphone, accessibility, shortcuts, practice
 
     var id: Self { self }
 
@@ -13,6 +13,7 @@ enum OnboardingStep: Int, CaseIterable, Identifiable {
         case .microphone: "Microphone"
         case .accessibility: "Accessibility"
         case .shortcuts: "Shortcuts"
+        case .practice: "Try it"
         }
     }
 
@@ -22,6 +23,7 @@ enum OnboardingStep: Int, CaseIterable, Identifiable {
         case .microphone: "mic"
         case .accessibility: "accessibility"
         case .shortcuts: "command"
+        case .practice: "text.cursor"
         }
     }
 }
@@ -150,6 +152,16 @@ protocol OnboardingModelInstalling: AnyObject {
     func onboardingInstallProgress(_ id: String) -> Double?
     /// Installs and returns nil on success, or the reason the model is still not installed.
     func onboardingInstall(_ descriptor: ModelDescriptor) async -> String?
+    /// Why the workspace could not read which models are installed, or nil while it is still reading or has read them.
+    /// Without this, a failed startup would leave setup on "Checking" for good.
+    var onboardingModelsCheckFailure: String? { get }
+    /// Reads the installed models again after a failed check.
+    func onboardingRetryModelsCheck() async
+}
+
+extension OnboardingModelInstalling {
+    var onboardingModelsCheckFailure: String? { nil }
+    func onboardingRetryModelsCheck() async {}
 }
 
 /// Permission status and requests. Only explicit button actions call the request methods.
@@ -181,6 +193,8 @@ final class OnboardingModel {
     static let explainedShortcuts: [ShortcutAction] = [.toggleDictation, .pauseResumeDictation, .showWorkspace]
 
     var step: OnboardingStep = .models
+    /// What the person has dictated into the practice field. It is only ever shown, never stored.
+    var practiceText = ""
     private(set) var microphone: OnboardingMicrophoneStatus = .notDetermined
     private(set) var accessibilityTrusted = false
     private(set) var isRequestingMicrophone = false
@@ -256,6 +270,7 @@ final class OnboardingModel {
     func status(of step: OnboardingStep) -> OnboardingStepStatus {
         switch step {
         case .models:
+            if modelCheckFailure != nil { return .actionNeeded }
             let speech = state(of: .speech), text = state(of: .text)
             if speech == .checking || text == .checking { return .checking }
             if isInstalling(speech) || isInstalling(text) { return .inProgress }
@@ -267,6 +282,8 @@ final class OnboardingModel {
             return accessibilityTrusted ? .complete : .optional
         case .shortcuts:
             return isSatisfied(.dictationShortcut) && shortcutProblem(for: .toggleDictation) == nil ? .complete : .optional
+        case .practice:
+            return practiceText.contains(where: { !$0.isWhitespace }) ? .complete : .optional
         }
     }
 
@@ -276,9 +293,30 @@ final class OnboardingModel {
 
     var isReadyToDictate: Bool { !missingRequirements.contains(where: \.isRequired) }
 
+    /// What stands between the person and Done: the microphone, the speech model and Accessibility, so that
+    /// dictation both works and lands in the field they started in. Skip Setup stays available on a first run.
+    var finishBlockers: [OnboardingRequirement] {
+        missingRequirements.filter { $0.isRequired || $0 == .accessibility }
+    }
+
+    /// Done is offered only when `finishBlockers` is empty. `finish()` itself never refuses, so a test or a
+    /// scripted run can still record completion.
+    var canFinish: Bool { finishBlockers.isEmpty }
+
     // MARK: Models
 
     var canInstallModels: Bool { models.onboardingCanInstall }
+
+    /// Set while the workspace failed to read its models; shown with a Check Again button.
+    var modelCheckFailure: String? {
+        guard !models.onboardingModelsChecked else { return nil }
+        return models.onboardingModelsCheckFailure
+    }
+
+    func retryModelsCheck() async {
+        guard modelCheckFailure != nil else { return }
+        await models.onboardingRetryModelsCheck()
+    }
 
     func state(of kind: OnboardingModelKind) -> ModelInstallState {
         let id = kind.descriptor.id

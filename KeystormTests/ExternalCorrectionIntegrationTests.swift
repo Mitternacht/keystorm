@@ -205,6 +205,8 @@ private struct ExternalCoordinatorRig {
         service = DictationDeliveryService(adapter: adapter, ownBundleIdentifier: "test.keystorm", ownProcessIdentifier: 999,
             correctionObservationScheduler: clock)
         coordinator = DictationCoordinator(backend: backend, delivery: service)
+        // Keeps the user's clipboard untouched; Copy when not inserted is covered in DictationCoordinatorTests.
+        coordinator.preferences.copyWhenNotInserted = false
     }
     func deliver() async {
         coordinator.toggle(); await coordinator.waitUntilSettled()

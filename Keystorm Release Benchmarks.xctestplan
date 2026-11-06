@@ -1,0 +1,48 @@
+{
+  "configurations" : [
+    {
+      "id" : "1920644D-E54C-4912-875E-A793044E1AEE",
+      "name" : "Test Scheme Action",
+      "options" : {
+
+      }
+    }
+  ],
+  "defaultOptions" : {
+    "codeCoverage" : false,
+    "environmentVariableEntries" : [
+      {
+        "isEnabled" : true,
+        "key" : "KEYSTORM_RUN_FINISH_LATENCY",
+        "value" : "1"
+      },
+      {
+        "isEnabled" : true,
+        "key" : "KEYSTORM_FINISH_LATENCY_COUNT",
+        "value" : "30"
+      },
+      {
+        "isEnabled" : true,
+        "key" : "KEYSTORM_FINISH_LATENCY_OUTPUT",
+        "value" : "\/tmp\/Keystorm-ReleaseBenchmarks\/candidate.json"
+      }
+    ],
+    "performanceAntipatternCheckerEnabled" : false,
+    "targetForVariableExpansion" : {
+      "containerPath" : "container:Keystorm.xcodeproj",
+      "identifier" : "47223C533084400F00C520EE",
+      "name" : "Keystorm"
+    },
+    "testInteropMode" : "complete"
+  },
+  "testTargets" : [
+    {
+      "target" : {
+        "containerPath" : "container:Keystorm.xcodeproj",
+        "identifier" : "47A54EF9309E09AC008B5745",
+        "name" : "KeystormBenchmarks"
+      }
+    }
+  ],
+  "version" : 1
+}

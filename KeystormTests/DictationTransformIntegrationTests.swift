@@ -9,6 +9,7 @@ import Testing
 struct DictationTransformIntegrationTests {
     @Test("Installed Qwen previews, explicitly applies, and restores a persisted original through the workspace",
           .enabled(if: ProcessInfo.processInfo.environment["KEYSTORM_RUN_DICTATION_TRANSFORM_INTEGRATION"] == "1"),
+          .exclusiveModelUse,
           .timeLimit(.minutes(10)))
     func actualLocalPreviewApplyReopenAndRestore() async throws {
         let root = FileManager.default.temporaryDirectory

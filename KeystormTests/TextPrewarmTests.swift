@@ -166,6 +166,104 @@ struct WorkspaceTextPrewarmTests {
         #expect(await model.prewarmTextModel() == nil)
     }
 
+    @Test("Dictation starts capture while an earlier prewarm remains blocked",
+          .enabled(if: ProcessInfo.processInfo.environment["KEYSTORM_RUN_RESIDENCY"] == "1"),
+          .exclusiveModelUse, .timeLimit(.minutes(1)))
+    func captureDoesNotWaitForPrewarm() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let models = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
+            appropriateFor: nil, create: false).appendingPathComponent("Keystorm/Models")
+        let source = FakeCaptureSource()
+        let probe = PrewarmProbe(outcome: .loaded, holds: true)
+        let model = WorkspaceModel(root: root, modelDirectory: models,
+            textPrewarmLoader: { await probe.prewarm() },
+            capture: AudioCapture(sourceFactory: { source }, allowsDebugFixture: false))
+        await model.initialize()
+        guard model.installedModelIDs.contains(ModelCatalog.primarySpeech.id) else {
+            await model.stopForTermination()
+            Issue.record("The explicitly enabled capture-start check requires the installed speech model; it downloads nothing.")
+            return
+        }
+        let oldSessionID = model.selectedSessionID
+        let prewarm = Task { await model.prewarmTextModel() }
+        await waitUntil { await probe.isWaiting }
+        let starting = Task { try await model.dictationBegin(mode: .verbatim) }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while source.startCount == 0 && ContinuousClock.now < deadline { await Task.yield() }
+        #expect(source.startCount == 1)
+        #expect(await probe.isWaiting, "Capture must start before the prewarm is released.")
+        #expect(await !probe.observedCancellation, "Starting the microphone must preserve the warm worker.")
+        #expect(model.sessions.contains { $0.id == oldSessionID }, "The earlier job's session must stay hydrated.")
+        if source.startCount > 0 { try source.push(frames: 3_200, at: 0) }
+        await probe.release()
+        _ = await prewarm.value
+        do {
+            let handle = try await starting.value
+            #expect(handle.sessionID != oldSessionID)
+            try await model.dictationPause(handle)
+            #expect(model.dictationMetadata(handle)?.state == .paused)
+            await model.stopForTermination()
+        } catch {
+            await model.stopForTermination()
+            throw error
+        }
+    }
+
+    @Test("Idle mode selection warms once and unrelated idle events do not rewarm",
+          .enabled(if: ProcessInfo.processInfo.environment["KEYSTORM_RUN_RESIDENCY"] == "1"),
+          .exclusiveModelUse, .timeLimit(.minutes(1)))
+    func idleModeSelectionWarmsOnce() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let models = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
+            appropriateFor: nil, create: false).appendingPathComponent("Keystorm/Models")
+        let probe = PrewarmProbe(outcome: .loaded)
+        let model = WorkspaceModel(root: root, modelDirectory: models,
+            textPrewarmLoader: { await probe.prewarm() })
+        let preferences = DictationPreferences()
+        preferences.mode = .verbatim
+        let coordinator = DictationCoordinator(backend: model, preferences: preferences)
+        let interactions = AppInteractionController()
+        defer { interactions.stop() }
+        await model.initialize()
+        do {
+            try #require(model.error == nil, "\(model.error ?? "")")
+            try #require(model.installedModelIDs.contains(ModelCatalog.primaryText.id),
+                "The opt-in observation check needs installed model metadata; the loader is fake and downloads nothing.")
+            interactions.configure(workspace: model, showWorkspace: {}, dictation: coordinator, startShortcuts: false)
+            try await Task.sleep(for: .milliseconds(30))
+            #expect(await probe.calls == 0, "Verbatim must not schedule text warm-up.")
+
+            preferences.mode = .clean
+            await waitUntil {
+                let calls = await probe.calls
+                return calls >= 1 && !model.isBusy
+            }
+            #expect(await probe.calls == 1)
+            await model.performWork("Unrelated idle transition", allowsLearningAfter: false) {}
+            try await Task.sleep(for: .milliseconds(30))
+            #expect(await probe.calls == 1, "Warm-up completion and later idle transitions must not reload the model.")
+
+            preferences.mode = .email
+            await waitUntil {
+                let calls = await probe.calls
+                return calls >= 2 && !model.isBusy
+            }
+            #expect(await probe.calls == 2, "A different transforming mode permits one new preparation.")
+            preferences.mode = .email
+            await model.performWork("Repeated idle transition", allowsLearningAfter: false) {}
+            try await Task.sleep(for: .milliseconds(30))
+            #expect(await probe.calls == 2, "Assigning the same mode must not start another warm-up.")
+        } catch {
+            await interactions.shutdown()
+            await model.stopForTermination()
+            throw error
+        }
+        await interactions.shutdown()
+        await model.stopForTermination()
+    }
+
     private func temporaryRoot() -> URL {
         FileManager.default.temporaryDirectory.appendingPathComponent("Keystorm-TextPrewarm-\(UUID().uuidString)", isDirectory: true)
     }
